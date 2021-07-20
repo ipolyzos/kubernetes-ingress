@@ -7,6 +7,7 @@ import conf_v1alpha1 "github.com/nginxinc/kubernetes-ingress/pkg/apis/configurat
 type ConfigParams struct {
 	ClientMaxBodySize                      string
 	DefaultServerAccessLogOff              bool
+	DefaultServerReturn                    string
 	FailTimeout                            string
 	HealthCheckEnabled                     bool
 	HealthCheckMandatory                   bool
@@ -48,6 +49,7 @@ type ConfigParams struct {
 	AppProtectLogConf                      string
 	AppProtectLogEnable                    string
 	MainAppProtectFailureModeAction        string
+	MainAppProtectCompressedRequestsAction string
 	MainAppProtectCookieSeed               string
 	MainAppProtectCPUThresholds            string
 	MainAppProtectPhysicalMemoryThresholds string
@@ -114,6 +116,8 @@ type StaticConfigParams struct {
 	MainAppProtectLoadModule       bool
 	PodName                        string
 	EnableLatencyMetrics           bool
+	EnablePreviewPolicies          bool
+	SSLRejectHandshake             bool
 }
 
 // GlobalConfigParams holds global configuration parameters. For now, it only holds listeners.
@@ -131,6 +135,7 @@ type Listener struct {
 // NewDefaultConfigParams creates a ConfigParams with default values.
 func NewDefaultConfigParams() *ConfigParams {
 	return &ConfigParams{
+		DefaultServerReturn:           "404",
 		ServerTokens:                  "on",
 		ProxyConnectTimeout:           "60s",
 		ProxyReadTimeout:              "60s",

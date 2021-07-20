@@ -18,16 +18,21 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-SCRIPT_ROOT=$(dirname ${BASH_SOURCE})/..
-CODEGEN_PKG=${CODEGEN_PKG:-$(cd ${SCRIPT_ROOT}; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo ../code-generator)}
+SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+CODEGEN_VERSION=$(grep 'k8s.io/code-generator' go.sum | awk '{print $2}' | sed 's/\/go.mod//g' | tail -1)
+CODEGEN_PKG=$(echo `go env GOPATH`"/pkg/mod/k8s.io/code-generator@${CODEGEN_VERSION}")
 
-echo "$(dirname ${BASH_SOURCE})/../../.."
+if [[ ! -d ${CODEGEN_PKG} ]]; then
+  echo "${CODEGEN_PKG} is missing. Running 'go mod download'."
+  go mod download
+fi
 
 # generate the code with:
 # --output-base    because this script should also be able to run inside the vendor dir of
 #                  k8s.io/kubernetes. The output-base is needed for the generators to output into the vendor dir
 #                  instead of the $GOPATH directly. For normal projects this can be dropped.
-${CODEGEN_PKG}/generate-groups.sh "deepcopy,client,informer,lister" \
+bash "${CODEGEN_PKG}"/generate-groups.sh "deepcopy,client,informer,lister" \
   github.com/nginxinc/kubernetes-ingress/pkg/client github.com/nginxinc/kubernetes-ingress/pkg/apis \
   configuration:v1alpha1,v1 \
-  --go-header-file ${SCRIPT_ROOT}/hack/boilerplate.go.txt
+  --output-base "$(dirname "${BASH_SOURCE[0]}")/../../../.." \
+  --go-header-file "${SCRIPT_ROOT}"/hack/boilerplate.go.txt

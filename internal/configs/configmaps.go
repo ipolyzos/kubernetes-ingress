@@ -246,6 +246,10 @@ func ParseConfigMap(cfgm *v1.ConfigMap, nginxPlus bool, hasAppProtect bool) *Con
 		}
 	}
 
+	if defaultServerReturn, exists := cfgm.Data["default-server-return"]; exists {
+		cfgParams.DefaultServerReturn = defaultServerReturn
+	}
+
 	if proxyBuffering, exists, err := GetMapKeyAsBool(cfgm.Data, "proxy-buffering", cfgm); exists {
 		if err != nil {
 			glog.Error(err)
@@ -467,6 +471,14 @@ func ParseConfigMap(cfgm *v1.ConfigMap, nginxPlus bool, hasAppProtect bool) *Con
 			}
 		}
 
+		if appProtectCompressedRequestsAction, exists := cfgm.Data["app-protect-compressed-requests-action"]; exists {
+			if appProtectCompressedRequestsAction == "pass" || appProtectCompressedRequestsAction == "drop" {
+				cfgParams.MainAppProtectCompressedRequestsAction = appProtectCompressedRequestsAction
+			} else {
+				glog.Error("ConfigMap Key 'app-protect-compressed-requests-action' must have value 'pass' or 'drop'. Ignoring.")
+			}
+		}
+
 		if appProtectCookieSeed, exists := cfgm.Data["app-protect-cookie-seed"]; exists {
 			cfgParams.MainAppProtectCookieSeed = appProtectCookieSeed
 		}
@@ -497,6 +509,7 @@ func GenerateNginxMainConfig(staticCfgParams *StaticConfigParams, config *Config
 	nginxCfg := &version1.MainConfig{
 		AccessLogOff:                       config.MainAccessLogOff,
 		DefaultServerAccessLogOff:          config.DefaultServerAccessLogOff,
+		DefaultServerReturn:                config.DefaultServerReturn,
 		ErrorLogLevel:                      config.MainErrorLogLevel,
 		HealthStatus:                       staticCfgParams.HealthStatus,
 		HealthStatusURI:                    staticCfgParams.HealthStatusURI,
@@ -529,6 +542,7 @@ func GenerateNginxMainConfig(staticCfgParams *StaticConfigParams, config *Config
 		SSLDHParam:                         config.MainServerSSLDHParam,
 		SSLPreferServerCiphers:             config.MainServerSSLPreferServerCiphers,
 		SSLProtocols:                       config.MainServerSSLProtocols,
+		SSLRejectHandshake:                 staticCfgParams.SSLRejectHandshake,
 		TLSPassthrough:                     staticCfgParams.TLSPassthrough,
 		StreamLogFormat:                    config.MainStreamLogFormat,
 		StreamLogFormatEscaping:            config.MainStreamLogFormatEscaping,
@@ -543,12 +557,14 @@ func GenerateNginxMainConfig(staticCfgParams *StaticConfigParams, config *Config
 		VariablesHashMaxSize:               config.VariablesHashMaxSize,
 		AppProtectLoadModule:               staticCfgParams.MainAppProtectLoadModule,
 		AppProtectFailureModeAction:        config.MainAppProtectFailureModeAction,
+		AppProtectCompressedRequestsAction: config.MainAppProtectCompressedRequestsAction,
 		AppProtectCookieSeed:               config.MainAppProtectCookieSeed,
 		AppProtectCPUThresholds:            config.MainAppProtectCPUThresholds,
 		AppProtectPhysicalMemoryThresholds: config.MainAppProtectPhysicalMemoryThresholds,
 		InternalRouteServer:                staticCfgParams.EnableInternalRoutes,
 		InternalRouteServerName:            staticCfgParams.PodName,
 		LatencyMetrics:                     staticCfgParams.EnableLatencyMetrics,
+		PreviewPolicies:                    staticCfgParams.EnablePreviewPolicies,
 	}
 	return nginxCfg
 }

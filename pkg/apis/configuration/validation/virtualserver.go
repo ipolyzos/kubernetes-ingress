@@ -172,41 +172,6 @@ func validatePositiveIntOrZeroFromPointer(n *int, fieldPath *field.Path) field.E
 	return allErrs
 }
 
-func validateTime(time string, fieldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
-
-	if time == "" {
-		return allErrs
-	}
-
-	if _, err := configs.ParseTime(time); err != nil {
-		return append(allErrs, field.Invalid(fieldPath, time, err.Error()))
-	}
-
-	return allErrs
-}
-
-// http://nginx.org/en/docs/syntax.html
-const offsetFmt = `\d+[kKmMgG]?`
-const offsetErrMsg = "must consist of numeric characters followed by a valid size suffix. 'k|K|m|M|g|G"
-
-var offsetRegexp = regexp.MustCompile("^" + offsetFmt + "$")
-
-func validateOffset(offset string, fieldPath *field.Path) field.ErrorList {
-	allErrs := field.ErrorList{}
-
-	if offset == "" {
-		return allErrs
-	}
-
-	if !offsetRegexp.MatchString(offset) {
-		msg := validation.RegexError(offsetErrMsg, offsetFmt, "16", "32k", "64M")
-		return append(allErrs, field.Invalid(fieldPath, offset, msg))
-	}
-
-	return allErrs
-}
-
 func validateBuffer(buff *v1.UpstreamBuffers, fieldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
 
@@ -331,7 +296,6 @@ func validateStatusMatch(s string, fieldPath *field.Path) field.ErrorList {
 
 	statuses := strings.Split(s, " ")
 	for i, value := range statuses {
-
 		if value == "!" {
 			if i != 0 {
 				allErrs = append(allErrs, field.Invalid(fieldPath, s, "`!` can only appear once at the beginning"))
@@ -417,8 +381,10 @@ func validateHeader(h v1.Header, fieldPath *field.Path) field.ErrorList {
 	return allErrs
 }
 
-const headerValueFmt = `([^"$\\]|\\[^$])*`
-const headerValueFmtErrMsg string = `a valid header must have all '"' escaped and must not contain any '$' or end with an unescaped '\'`
+const (
+	headerValueFmt              = `([^"$\\]|\\[^$])*`
+	headerValueFmtErrMsg string = `a valid header must have all '"' escaped and must not contain any '$' or end with an unescaped '\'`
+)
 
 var headerValueFmtRegexp = regexp.MustCompile("^" + headerValueFmt + "$")
 
@@ -444,9 +410,13 @@ func (vsv *VirtualServerValidator) validateUpstreams(upstreams []v1.Upstream, fi
 		} else {
 			upstreamNames.Insert(u.Name)
 		}
+		if u.UseClusterIP && u.Subselector != nil {
+			allErrs = append(allErrs, field.Forbidden(idxPath.Child("subselector"), "subselector can't be used with use-cluster-ip"))
+		} else {
+			allErrs = append(allErrs, validateLabels(u.Subselector, idxPath.Child("subselector"))...)
+		}
 
 		allErrs = append(allErrs, validateServiceName(u.Service, idxPath.Child("service"))...)
-		allErrs = append(allErrs, validateLabels(u.Subselector, idxPath.Child("subselector"))...)
 		allErrs = append(allErrs, validateTime(u.ProxyConnectTimeout, idxPath.Child("connect-timeout"))...)
 		allErrs = append(allErrs, validateTime(u.ProxyReadTimeout, idxPath.Child("read-timeout"))...)
 		allErrs = append(allErrs, validateTime(u.ProxySendTimeout, idxPath.Child("send-timeout"))...)
@@ -877,8 +847,10 @@ func validateEscapedStringWithVariables(body string, fieldPath *field.Path, spec
 	return allErrs
 }
 
-var actionReturnTypeFmt = `([^;\{\}"\\]|\\.)*`
-var actionReturnTypeErr = `must have all '"' (double quotes), '{', '}' or ';' escaped and must not end with an unescaped '\' (backslash)`
+var (
+	actionReturnTypeFmt = `([^;\{\}"\\]|\\.)*`
+	actionReturnTypeErr = `must have all '"' (double quotes), '{', '}' or ';' escaped and must not end with an unescaped '\' (backslash)`
+)
 
 var actionReturnTypeRegexp = regexp.MustCompile("^" + actionReturnTypeFmt + "$")
 
@@ -1181,8 +1153,10 @@ func validateRegexPath(path string, fieldPath *field.Path) field.ErrorList {
 	return allErrs
 }
 
-const pathFmt = `/[^\s{};]*`
-const pathErrMsg = "must start with / and must not include any whitespace character, `{`, `}` or `;`"
+const (
+	pathFmt    = `/[^\s{};]*`
+	pathErrMsg = "must start with / and must not include any whitespace character, `{`, `}` or `;`"
+)
 
 var pathRegexp = regexp.MustCompile("^" + pathFmt + "$")
 
@@ -1273,8 +1247,10 @@ func validateCondition(condition v1.Condition, fieldPath *field.Path) field.Erro
 	return allErrs
 }
 
-const cookieNameFmt string = "[_A-Za-z0-9]+"
-const cookieNameErrMsg string = "a valid cookie name must consist of alphanumeric characters or '_'"
+const (
+	cookieNameFmt    string = "[_A-Za-z0-9]+"
+	cookieNameErrMsg string = "a valid cookie name must consist of alphanumeric characters or '_'"
+)
 
 var cookieNameRegexp = regexp.MustCompile("^" + cookieNameFmt + "$")
 
@@ -1285,8 +1261,10 @@ func isCookieName(value string) []string {
 	return nil
 }
 
-const argumentNameFmt string = "[_A-Za-z0-9]+"
-const argumentNameErrMsg string = "a valid argument name must consist of alphanumeric characters or '_'"
+const (
+	argumentNameFmt    string = "[_A-Za-z0-9]+"
+	argumentNameErrMsg string = "a valid argument name must consist of alphanumeric characters or '_'"
+)
 
 var argumentNameRegexp = regexp.MustCompile("^" + argumentNameFmt + "$")
 

@@ -19,6 +19,7 @@ var configMap = v1.ConfigMap{
 		APIVersion: "v1",
 	},
 }
+
 var ingress = v1beta1.Ingress{
 	ObjectMeta: meta_v1.ObjectMeta{
 		Name:      "test",
@@ -230,7 +231,6 @@ func TestGetMapKeyAsStringSlice(t *testing.T) {
 	if !reflect.DeepEqual(expected, slice) {
 		t.Errorf("Unexpected return value:\nGot: %#v\nExpected: %#v", slice, expected)
 	}
-
 }
 
 func TestGetMapKeyAsStringSliceMultilineSnippets(t *testing.T) {
@@ -267,7 +267,7 @@ func TestGetMapKeyAsStringSliceNotFound(t *testing.T) {
 }
 
 func TestParseLBMethod(t *testing.T) {
-	var testsWithValidInput = []struct {
+	testsWithValidInput := []struct {
 		input    string
 		expected string
 	}{
@@ -281,7 +281,7 @@ func TestParseLBMethod(t *testing.T) {
 		{"hash $request_id consistent", "hash $request_id consistent"},
 	}
 
-	var invalidInput = []string{
+	invalidInput := []string{
 		"",
 		"blabla",
 		"least_time header",
@@ -313,7 +313,7 @@ func TestParseLBMethod(t *testing.T) {
 }
 
 func TestParseLBMethodForPlus(t *testing.T) {
-	var testsWithValidInput = []struct {
+	testsWithValidInput := []struct {
 		input    string
 		expected string
 	}{
@@ -332,7 +332,7 @@ func TestParseLBMethodForPlus(t *testing.T) {
 		{"least_time last_byte inflight", "least_time last_byte inflight"},
 	}
 
-	var invalidInput = []string{
+	invalidInput := []string{
 		"",
 		"blabla",
 		"hash123",
@@ -364,21 +364,100 @@ func TestParseLBMethodForPlus(t *testing.T) {
 }
 
 func TestParseTime(t *testing.T) {
-	var testsWithValidInput = []string{"1", "1m10s", "11 11", "5m 30s", "1s", "100m", "5w", "15m", "11M", "3h", "100y", "600"}
-	var invalidInput = []string{"ss", "rM", "m0m", "s1s", "-5s", "", "1L"}
+	testsWithValidInput := []struct {
+		input    string
+		expected string
+	}{
+		{"1h30m 5 100ms", "1h30m5s100ms"},
+		{"10ms", "10ms"},
+		{"1", "1s"},
+		{"5m 30s", "5m30s"},
+		{"1s", "1s"},
+		{"100m", "100m"},
+		{"5w", "5w"},
+		{"15m", "15m"},
+		{"11M", "11M"},
+		{"3h", "3h"},
+		{"100y", "100y"},
+		{"600", "600s"},
+	}
+	invalidInput := []string{"5s 5s", "ss", "rM", "m0m", "s1s", "-5s", "", "1L", "11 11", " ", "   "}
+
 	for _, test := range testsWithValidInput {
-		result, err := ParseTime(test)
+		result, err := ParseTime(test.input)
 		if err != nil {
-			t.Errorf("TestparseTime(%q) returned an error for valid input", test)
+			t.Errorf("TestparseTime(%q) returned an error for valid input", test.input)
 		}
-		if test != result {
-			t.Errorf("TestparseTime(%q) returned %q expected %q", test, result, test)
+
+		if result != test.expected {
+			t.Errorf("TestparseTime(%q) returned %q expected %q", test.input, result, test.expected)
 		}
 	}
+
 	for _, test := range invalidInput {
 		result, err := ParseTime(test)
 		if err == nil {
 			t.Errorf("TestparseTime(%q) didn't return error. Returned: %q", test, result)
+		}
+	}
+}
+
+func TestParseOffset(t *testing.T) {
+	testsWithValidInput := []string{"1", "2k", "2K", "3m", "3M", "4g", "4G"}
+	invalidInput := []string{"-1", "", "blah"}
+	for _, test := range testsWithValidInput {
+		result, err := ParseOffset(test)
+		if err != nil {
+			t.Errorf("TestParseOffset(%q) returned an error for valid input", test)
+		}
+		if test != result {
+			t.Errorf("TestParseOffset(%q) returned %q expected %q", test, result, test)
+		}
+	}
+	for _, test := range invalidInput {
+		result, err := ParseOffset(test)
+		if err == nil {
+			t.Errorf("TestParseOffset(%q) didn't return error. Returned: %q", test, result)
+		}
+	}
+}
+
+func TestParseSize(t *testing.T) {
+	testsWithValidInput := []string{"1", "2k", "2K", "3m", "3M"}
+	invalidInput := []string{"-1", "", "blah", "4g", "4G"}
+	for _, test := range testsWithValidInput {
+		result, err := ParseSize(test)
+		if err != nil {
+			t.Errorf("TestParseSize(%q) returned an error for valid input", test)
+		}
+		if test != result {
+			t.Errorf("TestParseSize(%q) returned %q expected %q", test, result, test)
+		}
+	}
+	for _, test := range invalidInput {
+		result, err := ParseSize(test)
+		if err == nil {
+			t.Errorf("TestParseSize(%q) didn't return error. Returned: %q", test, result)
+		}
+	}
+}
+
+func TestParseProxyBuffersSpec(t *testing.T) {
+	testsWithValidInput := []string{"1 1k", "10 24k", "2 2K", "6 3m", "128 3M"}
+	invalidInput := []string{"-1", "-6 2k", "", "blah", "16k", "10M", "2 4g", "3 4G"}
+	for _, test := range testsWithValidInput {
+		result, err := ParseProxyBuffersSpec(test)
+		if err != nil {
+			t.Errorf("ParseProxyBuffersSpec(%q) returned an error for valid input", test)
+		}
+		if test != result {
+			t.Errorf("TestParseProxyBuffersSpec(%q) returned %q expected %q", test, result, test)
+		}
+	}
+	for _, test := range invalidInput {
+		result, err := ParseProxyBuffersSpec(test)
+		if err == nil {
+			t.Errorf("TestParseProxyBuffersSpec(%q) didn't return error. Returned: %q", test, result)
 		}
 	}
 }
@@ -413,6 +492,155 @@ func TestVerifyThresholds(t *testing.T) {
 	for _, input := range invalidInput {
 		if VerifyAppProtectThresholds(input) {
 			t.Errorf("VerifyAppProtectThresholds(%s) returned true,expected false", input)
+		}
+	}
+}
+
+func TestParseBool(t *testing.T) {
+	testsWithValidInput := []struct {
+		input    string
+		expected bool
+	}{
+		{"0", false},
+		{"1", true},
+		{"true", true},
+		{"false", false},
+	}
+
+	invalidInput := []string{
+		"",
+		"blablah",
+		"-100",
+		"-1",
+	}
+
+	for _, test := range testsWithValidInput {
+		result, err := ParseBool(test.input)
+		if err != nil {
+			t.Errorf("TestParseBool(%q) returned an error for valid input", test.input)
+		}
+
+		if result != test.expected {
+			t.Errorf("TestParseBool(%q) returned %t expected %t", test.input, result, test.expected)
+		}
+	}
+
+	for _, input := range invalidInput {
+		_, err := ParseBool(input)
+		if err == nil {
+			t.Errorf("TestParseBool(%q) does not return an error for invalid input", input)
+		}
+	}
+}
+
+func TestParseInt(t *testing.T) {
+	testsWithValidInput := []struct {
+		input    string
+		expected int
+	}{
+		{"0", 0},
+		{"1", 1},
+		{"-100", -100},
+		{"123456789", 123456789},
+	}
+
+	invalidInput := []string{
+		"",
+		"blablah",
+		"10000000000000000000000000000000000000000000000000000000000000000",
+		"1,000",
+	}
+
+	for _, test := range testsWithValidInput {
+		result, err := ParseInt(test.input)
+		if err != nil {
+			t.Errorf("TestParseInt(%q) returned an error for valid input", test.input)
+		}
+
+		if result != test.expected {
+			t.Errorf("TestParseInt(%q) returned %d expected %d", test.input, result, test.expected)
+		}
+	}
+
+	for _, input := range invalidInput {
+		_, err := ParseInt(input)
+		if err == nil {
+			t.Errorf("TestParseInt(%q) does not return an error for invalid input", input)
+		}
+	}
+}
+
+func TestParseInt64(t *testing.T) {
+	testsWithValidInput := []struct {
+		input    string
+		expected int64
+	}{
+		{"0", 0},
+		{"1", 1},
+		{"-100", -100},
+		{"123456789", 123456789},
+	}
+
+	invalidInput := []string{
+		"",
+		"blablah",
+		"10000000000000000000000000000000000000000000000000000000000000000",
+		"1,000",
+	}
+
+	for _, test := range testsWithValidInput {
+		result, err := ParseInt64(test.input)
+		if err != nil {
+			t.Errorf("TestParseInt64(%q) returned an error for valid input", test.input)
+		}
+
+		if result != test.expected {
+			t.Errorf("TestParseInt64(%q) returned %d expected %d", test.input, result, test.expected)
+		}
+	}
+
+	for _, input := range invalidInput {
+		_, err := ParseInt64(input)
+		if err == nil {
+			t.Errorf("TestParseInt64(%q) does not return an error for invalid input", input)
+		}
+	}
+}
+
+func TestParseUint64(t *testing.T) {
+	testsWithValidInput := []struct {
+		input    string
+		expected uint64
+	}{
+		{"0", 0},
+		{"1", 1},
+		{"100", 100},
+		{"123456789", 123456789},
+	}
+
+	invalidInput := []string{
+		"",
+		"blablah",
+		"10000000000000000000000000000000000000000000000000000000000000000",
+		"1,000",
+		"-1023",
+	}
+
+	for _, test := range testsWithValidInput {
+		result, err := ParseUint64(test.input)
+		if err != nil {
+			t.Errorf("TestParseUint64(%q) returned an error for valid input", test.input)
+		}
+
+		if result != test.expected {
+			t.Errorf("TestParseUint64(%q) returned %d expected %d", test.input, result, test.expected)
+		}
+	}
+
+	for _, input := range invalidInput {
+		_, err := ParseUint64(input)
+		if err == nil {
+			t.Errorf("TestParseUint64(%q) does not return an error for invalid input", input)
 		}
 	}
 }

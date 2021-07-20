@@ -69,7 +69,7 @@ type Server struct {
 	SSL                   bool
 	SSLCertificate        string
 	SSLCertificateKey     string
-	SSLCiphers            string
+	SSLRejectHandshake    bool
 	TLSPassthrough        bool
 	GRPCOnly              bool
 	StatusZone            string
@@ -97,7 +97,7 @@ type Server struct {
 	SSLPorts            []int
 	AppProtectEnable    string
 	AppProtectPolicy    string
-	AppProtectLogConf   string
+	AppProtectLogConfs  []string
 	AppProtectLogEnable string
 
 	SpiffeCerts bool
@@ -136,6 +136,7 @@ type Location struct {
 	ProxyMaxTempFileSize string
 	ProxySSLName         string
 	JWTAuth              *JWTAuth
+	ServiceName          string
 
 	MinionIngress *Ingress
 }
@@ -144,6 +145,7 @@ type Location struct {
 type MainConfig struct {
 	AccessLogOff                       bool
 	DefaultServerAccessLogOff          bool
+	DefaultServerReturn                string
 	ErrorLogLevel                      string
 	HealthStatus                       bool
 	HealthStatusURI                    string
@@ -172,6 +174,7 @@ type MainConfig struct {
 	ServerNamesHashBucketSize          string
 	ServerNamesHashMaxSize             string
 	ServerTokens                       string
+	SSLRejectHandshake                 bool
 	SSLCiphers                         string
 	SSLDHParam                         string
 	SSLPreferServerCiphers             bool
@@ -190,12 +193,14 @@ type MainConfig struct {
 	WorkerShutdownTimeout              string
 	AppProtectLoadModule               bool
 	AppProtectFailureModeAction        string
+	AppProtectCompressedRequestsAction string
 	AppProtectCookieSeed               string
 	AppProtectCPUThresholds            string
 	AppProtectPhysicalMemoryThresholds string
 	InternalRouteServer                bool
 	InternalRouteServerName            string
 	LatencyMetrics                     bool
+	PreviewPolicies                    bool
 }
 
 // NewUpstreamWithDefaultServer creates an upstream with the default server.

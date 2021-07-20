@@ -8,6 +8,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	networking "k8s.io/api/networking/v1beta1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/nginxinc/kubernetes-ingress/internal/configs/version1"
 	"github.com/nginxinc/kubernetes-ingress/internal/configs/version2"
@@ -40,7 +41,7 @@ func createTestConfigurator() (*Configurator, error) {
 
 	manager := nginx.NewFakeManager("/etc/nginx")
 
-	return NewConfigurator(manager, createTestStaticConfigParams(), NewDefaultConfigParams(), NewDefaultGlobalConfigParams(), templateExecutor, templateExecutorV2, false, false, nil, false, nil, false), nil
+	return NewConfigurator(manager, createTestStaticConfigParams(), NewDefaultConfigParams(), templateExecutor, templateExecutorV2, false, false, nil, false, nil, false), nil
 }
 
 func createTestConfiguratorInvalidIngressTemplate() (*Configurator, error) {
@@ -56,7 +57,7 @@ func createTestConfiguratorInvalidIngressTemplate() (*Configurator, error) {
 
 	manager := nginx.NewFakeManager("/etc/nginx")
 
-	return NewConfigurator(manager, createTestStaticConfigParams(), NewDefaultConfigParams(), NewDefaultGlobalConfigParams(), templateExecutor, &version2.TemplateExecutor{}, false, false, nil, false, nil, false), nil
+	return NewConfigurator(manager, createTestStaticConfigParams(), NewDefaultConfigParams(), templateExecutor, &version2.TemplateExecutor{}, false, false, nil, false, nil, false), nil
 }
 
 func TestAddOrUpdateIngress(t *testing.T) {
@@ -67,9 +68,12 @@ func TestAddOrUpdateIngress(t *testing.T) {
 
 	ingress := createCafeIngressEx()
 
-	err = cnf.AddOrUpdateIngress(&ingress)
+	warnings, err := cnf.AddOrUpdateIngress(&ingress)
 	if err != nil {
 		t.Errorf("AddOrUpdateIngress returned:  \n%v, but expected: \n%v", err, nil)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("AddOrUpdateIngress returned warnings: %v", warnings)
 	}
 
 	cnfHasIngress := cnf.HasIngress(ingress.Ingress)
@@ -86,9 +90,12 @@ func TestAddOrUpdateMergeableIngress(t *testing.T) {
 
 	mergeableIngess := createMergeableCafeIngress()
 
-	err = cnf.AddOrUpdateMergeableIngress(mergeableIngess)
+	warnings, err := cnf.AddOrUpdateMergeableIngress(mergeableIngess)
 	if err != nil {
 		t.Errorf("AddOrUpdateMergeableIngress returned \n%v, expected \n%v", err, nil)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("AddOrUpdateMergeableIngress returned warnings: %v", warnings)
 	}
 
 	cnfHasMergeableIngress := cnf.HasIngress(mergeableIngess.Master.Ingress)
@@ -105,9 +112,12 @@ func TestAddOrUpdateIngressFailsWithInvalidIngressTemplate(t *testing.T) {
 
 	ingress := createCafeIngressEx()
 
-	err = cnf.AddOrUpdateIngress(&ingress)
+	warnings, err := cnf.AddOrUpdateIngress(&ingress)
 	if err == nil {
-		t.Errorf("AddOrUpdateIngressFailsWithInvalidTemplate returned \n%v,  but expected \n%v", nil, "template execution error")
+		t.Errorf("AddOrUpdateIngress returned \n%v,  but expected \n%v", nil, "template execution error")
+	}
+	if len(warnings) != 0 {
+		t.Errorf("AddOrUpdateIngress returned warnings: %v", warnings)
 	}
 }
 
@@ -119,9 +129,12 @@ func TestAddOrUpdateMergeableIngressFailsWithInvalidIngressTemplate(t *testing.T
 
 	mergeableIngess := createMergeableCafeIngress()
 
-	err = cnf.AddOrUpdateMergeableIngress(mergeableIngess)
+	warnings, err := cnf.AddOrUpdateMergeableIngress(mergeableIngess)
 	if err == nil {
 		t.Errorf("AddOrUpdateMergeableIngress returned \n%v, but expected \n%v", nil, "template execution error")
+	}
+	if len(warnings) != 0 {
+		t.Errorf("AddOrUpdateMergeableIngress returned warnings: %v", warnings)
 	}
 }
 
@@ -222,58 +235,6 @@ func TestGetFileNameForVirtualServerFromKey(t *testing.T) {
 	}
 }
 
-func TestCheckIfListenerExists(t *testing.T) {
-	tests := []struct {
-		listener conf_v1alpha1.TransportServerListener
-		expected bool
-		msg      string
-	}{
-		{
-			listener: conf_v1alpha1.TransportServerListener{
-				Name:     "tcp-listener",
-				Protocol: "TCP",
-			},
-			expected: true,
-			msg:      "name and protocol match",
-		},
-		{
-			listener: conf_v1alpha1.TransportServerListener{
-				Name:     "some-listener",
-				Protocol: "TCP",
-			},
-			expected: false,
-			msg:      "only protocol matches",
-		},
-		{
-			listener: conf_v1alpha1.TransportServerListener{
-				Name:     "tcp-listener",
-				Protocol: "UDP",
-			},
-			expected: false,
-			msg:      "only name matches",
-		},
-	}
-
-	cnf, err := createTestConfigurator()
-	if err != nil {
-		t.Errorf("Failed to create a test configurator: %v", err)
-	}
-
-	cnf.globalCfgParams.Listeners = map[string]Listener{
-		"tcp-listener": {
-			Port:     53,
-			Protocol: "TCP",
-		},
-	}
-
-	for _, test := range tests {
-		result := cnf.CheckIfListenerExists(&test.listener)
-		if result != test.expected {
-			t.Errorf("CheckIfListenerExists() returned %v but expected %v for the case of %q", result, test.expected, test.msg)
-		}
-	}
-}
-
 func TestGetFileNameForTransportServer(t *testing.T) {
 	transportServer := &conf_v1alpha1.TransportServer{
 		ObjectMeta: meta_v1.ObjectMeta{
@@ -315,121 +276,26 @@ func TestGenerateNamespaceNameKey(t *testing.T) {
 	}
 }
 
-func TestUpdateGlobalConfiguration(t *testing.T) {
-	globalConfiguration := &conf_v1alpha1.GlobalConfiguration{
-		Spec: conf_v1alpha1.GlobalConfigurationSpec{
-			Listeners: []conf_v1alpha1.Listener{
-				{
-					Name:     "tcp-listener",
-					Port:     53,
-					Protocol: "TCP",
-				},
-			},
-		},
-	}
-
-	tsExTCP := &TransportServerEx{
-		TransportServer: &conf_v1alpha1.TransportServer{
-			ObjectMeta: meta_v1.ObjectMeta{
-				Name:      "tcp-server",
-				Namespace: "default",
-			},
-			Spec: conf_v1alpha1.TransportServerSpec{
-				Listener: conf_v1alpha1.TransportServerListener{
-					Name:     "tcp-listener",
-					Protocol: "TCP",
-				},
-				Upstreams: []conf_v1alpha1.Upstream{
-					{
-						Name:    "tcp-app",
-						Service: "tcp-app-svc",
-						Port:    5001,
-					},
-				},
-				Action: &conf_v1alpha1.Action{
-					Pass: "tcp-app",
-				},
-			},
-		},
-	}
-
-	tsExUDP := &TransportServerEx{
-		TransportServer: &conf_v1alpha1.TransportServer{
-			ObjectMeta: meta_v1.ObjectMeta{
-				Name:      "udp-server",
-				Namespace: "default",
-			},
-			Spec: conf_v1alpha1.TransportServerSpec{
-				Listener: conf_v1alpha1.TransportServerListener{
-					Name:     "udp-listener",
-					Protocol: "UDP",
-				},
-				Upstreams: []conf_v1alpha1.Upstream{
-					{
-						Name:    "udp-app",
-						Service: "udp-app-svc",
-						Port:    5001,
-					},
-				},
-				Action: &conf_v1alpha1.Action{
-					Pass: "udp-app",
-				},
-			},
-		},
-	}
-
-	cnf, err := createTestConfigurator()
-	if err != nil {
-		t.Fatalf("Failed to create a test configurator: %v", err)
-	}
-
-	transportServerExes := []*TransportServerEx{tsExTCP, tsExUDP}
-
-	expectedUpdatedTransportServerExes := []*TransportServerEx{tsExTCP}
-	expectedDeletedTransportServerExes := []*TransportServerEx{tsExUDP}
-
-	updatedTransportServerExes, deletedTransportServerExes, err := cnf.UpdateGlobalConfiguration(globalConfiguration, transportServerExes)
-
-	if !reflect.DeepEqual(updatedTransportServerExes, expectedUpdatedTransportServerExes) {
-		t.Errorf("UpdateGlobalConfiguration() returned %v but expected %v", updatedTransportServerExes, expectedUpdatedTransportServerExes)
-	}
-	if !reflect.DeepEqual(deletedTransportServerExes, expectedDeletedTransportServerExes) {
-		t.Errorf("UpdateGlobalConfiguration() returned %v but expected %v", deletedTransportServerExes, expectedDeletedTransportServerExes)
-	}
-	if err != nil {
-		t.Errorf("UpdateGlobalConfiguration() returned an unexpected error %v", err)
-	}
-}
-
 func TestGenerateTLSPassthroughHostsConfig(t *testing.T) {
 	tlsPassthroughPairs := map[string]tlsPassthroughPair{
 		"default/ts-1": {
-			Host:       "app.example.com",
+			Host:       "one.example.com",
 			UnixSocket: "socket1.sock",
 		},
 		"default/ts-2": {
-			Host:       "app.example.com",
+			Host:       "two.example.com",
 			UnixSocket: "socket2.sock",
-		},
-		"default/ts-3": {
-			Host:       "some.example.com",
-			UnixSocket: "socket3.sock",
 		},
 	}
 
 	expectedCfg := &version2.TLSPassthroughHostsConfig{
-		"app.example.com":  "socket2.sock",
-		"some.example.com": "socket3.sock",
+		"one.example.com": "socket1.sock",
+		"two.example.com": "socket2.sock",
 	}
-	expectedDuplicatedHosts := []string{"app.example.com"}
 
-	resultCfg, resultDuplicatedHosts := generateTLSPassthroughHostsConfig(tlsPassthroughPairs)
+	resultCfg := generateTLSPassthroughHostsConfig(tlsPassthroughPairs)
 	if !reflect.DeepEqual(resultCfg, expectedCfg) {
 		t.Errorf("generateTLSPassthroughHostsConfig() returned %v but expected %v", resultCfg, expectedCfg)
-	}
-
-	if !reflect.DeepEqual(resultDuplicatedHosts, expectedDuplicatedHosts) {
-		t.Errorf("generateTLSPassthroughHostsConfig() returned %v but expected %v", resultDuplicatedHosts, expectedDuplicatedHosts)
 	}
 }
 
@@ -491,33 +357,23 @@ func TestFindRemovedKeys(t *testing.T) {
 	}
 }
 
-func TestCreateUpstreamServerLabels(t *testing.T) {
-	expected := []string{"coffee-svc", "ingress", "cafe", "default"}
-	result := createUpstreamServerLabels("coffee-svc", "ingress", "cafe", "default")
-	if !reflect.DeepEqual(result, expected) {
-		t.Errorf("createUpstreamServerLabels(%v, %v, %v, %v) returned %v but expected %v", "coffee-svc", "ingress", "cafe", "default", result, expected)
-	}
-}
-
-func TestCreateServerZoneLabels(t *testing.T) {
-	expected := []string{"ingress", "cafe", "default"}
-	result := createServerZoneLabels("ingress", "cafe", "default")
-	if !reflect.DeepEqual(result, expected) {
-		t.Errorf("createServerZoneLabels(%v, %v, %v) returned %v but expected %v", "ingress", "cafe", "default", result, expected)
-	}
-}
-
 type mockLabelUpdater struct {
-	upstreamServerLabels     map[string][]string
-	serverZoneLabels         map[string][]string
-	upstreamServerPeerLabels map[string][]string
+	upstreamServerLabels           map[string][]string
+	serverZoneLabels               map[string][]string
+	upstreamServerPeerLabels       map[string][]string
+	streamUpstreamServerPeerLabels map[string][]string
+	streamUpstreamServerLabels     map[string][]string
+	streamServerZoneLabels         map[string][]string
 }
 
 func newFakeLabelUpdater() *mockLabelUpdater {
 	return &mockLabelUpdater{
-		upstreamServerLabels:     make(map[string][]string),
-		serverZoneLabels:         make(map[string][]string),
-		upstreamServerPeerLabels: make(map[string][]string),
+		upstreamServerLabels:           make(map[string][]string),
+		serverZoneLabels:               make(map[string][]string),
+		upstreamServerPeerLabels:       make(map[string][]string),
+		streamUpstreamServerPeerLabels: make(map[string][]string),
+		streamUpstreamServerLabels:     make(map[string][]string),
+		streamServerZoneLabels:         make(map[string][]string),
 	}
 }
 
@@ -535,6 +391,20 @@ func (u *mockLabelUpdater) DeleteUpstreamServerPeerLabels(peers []string) {
 	}
 }
 
+// UpdateStreamUpstreamServerPeerLabels updates the Upstream Server Peer Labels
+func (u *mockLabelUpdater) UpdateStreamUpstreamServerPeerLabels(upstreamServerPeerLabels map[string][]string) {
+	for k, v := range upstreamServerPeerLabels {
+		u.streamUpstreamServerPeerLabels[k] = v
+	}
+}
+
+// DeleteStreamUpstreamServerPeerLabels deletes the Upstream Server Peer Labels
+func (u *mockLabelUpdater) DeleteStreamUpstreamServerPeerLabels(peers []string) {
+	for _, k := range peers {
+		delete(u.streamUpstreamServerPeerLabels, k)
+	}
+}
+
 // UpdateUpstreamServerLabels updates the Upstream Server Labels
 func (u *mockLabelUpdater) UpdateUpstreamServerLabels(upstreamServerLabelValues map[string][]string) {
 	for k, v := range upstreamServerLabelValues {
@@ -549,6 +419,20 @@ func (u *mockLabelUpdater) DeleteUpstreamServerLabels(upstreamNames []string) {
 	}
 }
 
+// UpdateStreamUpstreamServerLabels updates the Stream Upstream Server Labels
+func (u *mockLabelUpdater) UpdateStreamUpstreamServerLabels(streamUpstreamServerLabelValues map[string][]string) {
+	for k, v := range streamUpstreamServerLabelValues {
+		u.streamUpstreamServerLabels[k] = v
+	}
+}
+
+// DeleteStreamUpstreamServerLabels deletes the Stream Upstream Server Labels
+func (u *mockLabelUpdater) DeleteStreamUpstreamServerLabels(streamUpstreamServerNames []string) {
+	for _, k := range streamUpstreamServerNames {
+		delete(u.streamUpstreamServerLabels, k)
+	}
+}
+
 // UpdateServerZoneLabels updates the Server Zone Labels
 func (u *mockLabelUpdater) UpdateServerZoneLabels(serverZoneLabelValues map[string][]string) {
 	for k, v := range serverZoneLabelValues {
@@ -560,6 +444,20 @@ func (u *mockLabelUpdater) UpdateServerZoneLabels(serverZoneLabelValues map[stri
 func (u *mockLabelUpdater) DeleteServerZoneLabels(zoneNames []string) {
 	for _, k := range zoneNames {
 		delete(u.serverZoneLabels, k)
+	}
+}
+
+// UpdateStreamServerZoneLabels updates the Server Zone Labels
+func (u *mockLabelUpdater) UpdateStreamServerZoneLabels(streamServerZoneLabelValues map[string][]string) {
+	for k, v := range streamServerZoneLabelValues {
+		u.streamServerZoneLabels[k] = v
+	}
+}
+
+// DeleteStreamServerZoneLabels deletes the Server Zone Labels
+func (u *mockLabelUpdater) DeleteStreamServerZoneLabels(zoneNames []string) {
+	for _, k := range zoneNames {
+		delete(u.streamServerZoneLabels, k)
 	}
 }
 
@@ -691,7 +589,10 @@ func TestUpdateIngressMetricsLabels(t *testing.T) {
 		serverZoneLabels: map[string][]string{
 			"example.com": {"ingress", "test-ingress", "default"},
 		},
-		upstreamServerPeerLabels: upstreamServerPeerLabels,
+		upstreamServerPeerLabels:       upstreamServerPeerLabels,
+		streamUpstreamServerPeerLabels: make(map[string][]string),
+		streamUpstreamServerLabels:     make(map[string][]string),
+		streamServerZoneLabels:         make(map[string][]string),
 	}
 	expectedLatencyCollector := &mockLatencyCollector{
 		upstreamServerLabels:     upstreamServerLabels,
@@ -738,7 +639,10 @@ func TestUpdateIngressMetricsLabels(t *testing.T) {
 		serverZoneLabels: map[string][]string{
 			"example.com": {"ingress", "test-ingress", "default"},
 		},
-		upstreamServerPeerLabels: upstreamServerPeerLabels,
+		upstreamServerPeerLabels:       upstreamServerPeerLabels,
+		streamUpstreamServerPeerLabels: make(map[string][]string),
+		streamUpstreamServerLabels:     make(map[string][]string),
+		streamServerZoneLabels:         map[string][]string{},
 	}
 	expectedLatencyCollector = &mockLatencyCollector{
 		upstreamServerLabels:        upstreamServerLabels,
@@ -759,9 +663,12 @@ func TestUpdateIngressMetricsLabels(t *testing.T) {
 	upstreamServerPeerLabels = map[string][]string{}
 
 	expectedLabelUpdater = &mockLabelUpdater{
-		upstreamServerLabels:     map[string][]string{},
-		serverZoneLabels:         map[string][]string{},
-		upstreamServerPeerLabels: map[string][]string{},
+		upstreamServerLabels:           map[string][]string{},
+		serverZoneLabels:               map[string][]string{},
+		upstreamServerPeerLabels:       map[string][]string{},
+		streamUpstreamServerPeerLabels: map[string][]string{},
+		streamUpstreamServerLabels:     map[string][]string{},
+		streamServerZoneLabels:         map[string][]string{},
 	}
 	expectedLatencyCollector = &mockLatencyCollector{
 		upstreamServerLabels:        upstreamServerLabels,
@@ -852,7 +759,10 @@ func TestUpdateVirtualServerMetricsLabels(t *testing.T) {
 		serverZoneLabels: map[string][]string{
 			"example.com": {"virtualserver", "test-vs", "default"},
 		},
-		upstreamServerPeerLabels: upstreamServerPeerLabels,
+		upstreamServerPeerLabels:       upstreamServerPeerLabels,
+		streamUpstreamServerPeerLabels: map[string][]string{},
+		streamUpstreamServerLabels:     map[string][]string{},
+		streamServerZoneLabels:         map[string][]string{},
 	}
 
 	expectedLatencyCollector := &mockLatencyCollector{
@@ -898,7 +808,10 @@ func TestUpdateVirtualServerMetricsLabels(t *testing.T) {
 		serverZoneLabels: map[string][]string{
 			"example.com": {"virtualserver", "test-vs", "default"},
 		},
-		upstreamServerPeerLabels: upstreamServerPeerLabels,
+		upstreamServerPeerLabels:       upstreamServerPeerLabels,
+		streamUpstreamServerPeerLabels: map[string][]string{},
+		streamUpstreamServerLabels:     map[string][]string{},
+		streamServerZoneLabels:         map[string][]string{},
 	}
 
 	expectedLatencyCollector = &mockLatencyCollector{
@@ -917,9 +830,12 @@ func TestUpdateVirtualServerMetricsLabels(t *testing.T) {
 	}
 
 	expectedLabelUpdater = &mockLabelUpdater{
-		upstreamServerLabels:     map[string][]string{},
-		serverZoneLabels:         map[string][]string{},
-		upstreamServerPeerLabels: map[string][]string{},
+		upstreamServerLabels:           map[string][]string{},
+		serverZoneLabels:               map[string][]string{},
+		upstreamServerPeerLabels:       map[string][]string{},
+		streamUpstreamServerPeerLabels: map[string][]string{},
+		streamUpstreamServerLabels:     map[string][]string{},
+		streamServerZoneLabels:         map[string][]string{},
 	}
 
 	expectedLatencyCollector = &mockLatencyCollector{
@@ -936,5 +852,424 @@ func TestUpdateVirtualServerMetricsLabels(t *testing.T) {
 
 	if !reflect.DeepEqual(testLatencyCollector, expectedLatencyCollector) {
 		t.Errorf("updateVirtualServerMetricsLabels() updated latency collector's labels to \n%+v but expected \n%+v", testLatencyCollector, expectedLatencyCollector)
+	}
+}
+
+func TestUpdateTransportServerMetricsLabels(t *testing.T) {
+	cnf, err := createTestConfigurator()
+	if err != nil {
+		t.Fatalf("Failed to create a test configurator: %v", err)
+	}
+
+	cnf.isPlus = true
+	cnf.labelUpdater = newFakeLabelUpdater()
+
+	tsEx := &TransportServerEx{
+		TransportServer: &conf_v1alpha1.TransportServer{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "test-transportserver",
+				Namespace: "default",
+			},
+			Spec: conf_v1alpha1.TransportServerSpec{
+				Listener: conf_v1alpha1.TransportServerListener{
+					Name:     "dns-tcp",
+					Protocol: "TCP",
+				},
+			},
+		},
+		PodsByIP: map[string]string{
+			"10.0.0.1:80": "pod-1",
+			"10.0.0.2:80": "pod-2",
+		},
+	}
+
+	streamUpstreams := []version2.StreamUpstream{
+		{
+			Name: "upstream-1",
+			Servers: []version2.StreamUpstreamServer{
+				{
+					Address: "10.0.0.1:80",
+				},
+			},
+			UpstreamLabels: version2.UpstreamLabels{
+				Service:           "service-1",
+				ResourceType:      "transportserver",
+				ResourceName:      tsEx.TransportServer.Name,
+				ResourceNamespace: tsEx.TransportServer.Namespace,
+			},
+		},
+		{
+			Name: "upstream-2",
+			Servers: []version2.StreamUpstreamServer{
+				{
+					Address: "10.0.0.2:80",
+				},
+			},
+			UpstreamLabels: version2.UpstreamLabels{
+				Service:           "service-2",
+				ResourceType:      "transportserver",
+				ResourceName:      tsEx.TransportServer.Name,
+				ResourceNamespace: tsEx.TransportServer.Namespace,
+			},
+		},
+	}
+
+	streamUpstreamServerLabels := map[string][]string{
+		"upstream-1": {"service-1", "transportserver", "test-transportserver", "default"},
+		"upstream-2": {"service-2", "transportserver", "test-transportserver", "default"},
+	}
+
+	streamUpstreamServerPeerLabels := map[string][]string{
+		"upstream-1/10.0.0.1:80": {"pod-1"},
+		"upstream-2/10.0.0.2:80": {"pod-2"},
+	}
+
+	expectedLabelUpdater := &mockLabelUpdater{
+		streamUpstreamServerLabels: streamUpstreamServerLabels,
+		streamServerZoneLabels: map[string][]string{
+			"dns-tcp": {"transportserver", "test-transportserver", "default"},
+		},
+		streamUpstreamServerPeerLabels: streamUpstreamServerPeerLabels,
+		upstreamServerPeerLabels:       make(map[string][]string),
+		upstreamServerLabels:           make(map[string][]string),
+		serverZoneLabels:               make(map[string][]string),
+	}
+
+	cnf.updateTransportServerMetricsLabels(tsEx, streamUpstreams)
+	if !reflect.DeepEqual(cnf.labelUpdater, expectedLabelUpdater) {
+		t.Errorf("updateTransportServerMetricsLabels() updated labels to \n%+v but expected \n%+v", cnf.labelUpdater, expectedLabelUpdater)
+	}
+
+	updatedStreamUpstreams := []version2.StreamUpstream{
+		{
+			Name: "upstream-1",
+			Servers: []version2.StreamUpstreamServer{
+				{
+					Address: "10.0.0.1:80",
+				},
+			},
+			UpstreamLabels: version2.UpstreamLabels{
+				Service:           "service-1",
+				ResourceType:      "transportserver",
+				ResourceName:      tsEx.TransportServer.Name,
+				ResourceNamespace: tsEx.TransportServer.Namespace,
+			},
+		},
+	}
+
+	streamUpstreamServerLabels = map[string][]string{
+		"upstream-1": {"service-1", "transportserver", "test-transportserver", "default"},
+	}
+
+	streamUpstreamServerPeerLabels = map[string][]string{
+		"upstream-1/10.0.0.1:80": {"pod-1"},
+	}
+
+	expectedLabelUpdater = &mockLabelUpdater{
+		streamUpstreamServerLabels: streamUpstreamServerLabels,
+		streamServerZoneLabels: map[string][]string{
+			"dns-tcp": {"transportserver", "test-transportserver", "default"},
+		},
+		streamUpstreamServerPeerLabels: streamUpstreamServerPeerLabels,
+		upstreamServerPeerLabels:       map[string][]string{},
+		upstreamServerLabels:           map[string][]string{},
+		serverZoneLabels:               map[string][]string{},
+	}
+
+	cnf.updateTransportServerMetricsLabels(tsEx, updatedStreamUpstreams)
+	if !reflect.DeepEqual(cnf.labelUpdater, expectedLabelUpdater) {
+		t.Errorf("updateTransportServerMetricsLabels() updated labels to \n%+v but expected \n%+v", cnf.labelUpdater, expectedLabelUpdater)
+	}
+
+	expectedLabelUpdater = &mockLabelUpdater{
+		upstreamServerLabels:           map[string][]string{},
+		serverZoneLabels:               map[string][]string{},
+		upstreamServerPeerLabels:       map[string][]string{},
+		streamUpstreamServerPeerLabels: map[string][]string{},
+		streamUpstreamServerLabels:     map[string][]string{},
+		streamServerZoneLabels:         map[string][]string{},
+	}
+
+	cnf.deleteTransportServerMetricsLabels("default/test-transportserver")
+	if !reflect.DeepEqual(cnf.labelUpdater, expectedLabelUpdater) {
+		t.Errorf("deleteTransportServerMetricsLabels() updated labels to \n%+v but expected \n%+v", cnf.labelUpdater, expectedLabelUpdater)
+	}
+
+	tsExTLS := &TransportServerEx{
+		TransportServer: &conf_v1alpha1.TransportServer{
+			ObjectMeta: meta_v1.ObjectMeta{
+				Name:      "test-transportserver-tls",
+				Namespace: "default",
+			},
+			Spec: conf_v1alpha1.TransportServerSpec{
+				Listener: conf_v1alpha1.TransportServerListener{
+					Name:     "tls-passthrough",
+					Protocol: "TLS_PASSTHROUGH",
+				},
+				Host: "example.com",
+			},
+		},
+		PodsByIP: map[string]string{
+			"10.0.0.3:80": "pod-3",
+		},
+	}
+
+	streamUpstreams = []version2.StreamUpstream{
+		{
+			Name: "upstream-3",
+			Servers: []version2.StreamUpstreamServer{
+				{
+					Address: "10.0.0.3:80",
+				},
+			},
+			UpstreamLabels: version2.UpstreamLabels{
+				Service:           "service-3",
+				ResourceType:      "transportserver",
+				ResourceName:      tsExTLS.TransportServer.Name,
+				ResourceNamespace: tsExTLS.TransportServer.Namespace,
+			},
+		},
+	}
+
+	streamUpstreamServerLabels = map[string][]string{
+		"upstream-3": {"service-3", "transportserver", "test-transportserver-tls", "default"},
+	}
+
+	streamUpstreamServerPeerLabels = map[string][]string{
+		"upstream-3/10.0.0.3:80": {"pod-3"},
+	}
+
+	expectedLabelUpdater = &mockLabelUpdater{
+		streamUpstreamServerLabels: streamUpstreamServerLabels,
+		streamServerZoneLabels: map[string][]string{
+			"example.com": {"transportserver", "test-transportserver-tls", "default"},
+		},
+		streamUpstreamServerPeerLabels: streamUpstreamServerPeerLabels,
+		upstreamServerPeerLabels:       make(map[string][]string),
+		upstreamServerLabels:           make(map[string][]string),
+		serverZoneLabels:               make(map[string][]string),
+	}
+
+	cnf.updateTransportServerMetricsLabels(tsExTLS, streamUpstreams)
+	if !reflect.DeepEqual(cnf.labelUpdater, expectedLabelUpdater) {
+		t.Errorf("updateTransportServerMetricsLabels() updated labels to \n%+v but expected \n%+v", cnf.labelUpdater, expectedLabelUpdater)
+	}
+
+	expectedLabelUpdater = &mockLabelUpdater{
+		upstreamServerLabels:           map[string][]string{},
+		serverZoneLabels:               map[string][]string{},
+		upstreamServerPeerLabels:       map[string][]string{},
+		streamUpstreamServerPeerLabels: map[string][]string{},
+		streamUpstreamServerLabels:     map[string][]string{},
+		streamServerZoneLabels:         map[string][]string{},
+	}
+
+	cnf.deleteTransportServerMetricsLabels("default/test-transportserver-tls")
+	if !reflect.DeepEqual(cnf.labelUpdater, expectedLabelUpdater) {
+		t.Errorf("deleteTransportServerMetricsLabels() updated labels to \n%+v but expected \n%+v", cnf.labelUpdater, expectedLabelUpdater)
+	}
+}
+
+func TestUpdateApResources(t *testing.T) {
+	appProtectPolicy := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"namespace": "test-ns",
+				"name":      "test-name",
+			},
+		},
+	}
+	appProtectLogConf := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"namespace": "test-ns",
+				"name":      "test-name",
+			},
+		},
+	}
+	appProtectLogDst := "test-dst"
+
+	tests := []struct {
+		ingEx    *IngressEx
+		expected AppProtectResources
+		msg      string
+	}{
+		{
+			ingEx: &IngressEx{
+				Ingress: &networking.Ingress{
+					ObjectMeta: meta_v1.ObjectMeta{},
+				},
+			},
+			expected: AppProtectResources{},
+			msg:      "no app protect resources",
+		},
+		{
+			ingEx: &IngressEx{
+				Ingress: &networking.Ingress{
+					ObjectMeta: meta_v1.ObjectMeta{},
+				},
+				AppProtectPolicy: appProtectPolicy,
+			},
+			expected: AppProtectResources{
+				AppProtectPolicy: "/etc/nginx/waf/nac-policies/test-ns_test-name",
+			},
+			msg: "app protect policy",
+		},
+		{
+			ingEx: &IngressEx{
+				Ingress: &networking.Ingress{
+					ObjectMeta: meta_v1.ObjectMeta{},
+				},
+				AppProtectLogs: []AppProtectLog{
+					{
+						LogConf: appProtectLogConf,
+						Dest:    appProtectLogDst,
+					},
+				},
+			},
+			expected: AppProtectResources{
+				AppProtectLogconfs: []string{"/etc/nginx/waf/nac-logconfs/test-ns_test-name test-dst"},
+			},
+			msg: "app protect log conf",
+		},
+		{
+			ingEx: &IngressEx{
+				Ingress: &networking.Ingress{
+					ObjectMeta: meta_v1.ObjectMeta{},
+				},
+				AppProtectPolicy: appProtectPolicy,
+				AppProtectLogs: []AppProtectLog{
+					{
+						LogConf: appProtectLogConf,
+						Dest:    appProtectLogDst,
+					},
+				},
+			},
+			expected: AppProtectResources{
+				AppProtectPolicy:   "/etc/nginx/waf/nac-policies/test-ns_test-name",
+				AppProtectLogconfs: []string{"/etc/nginx/waf/nac-logconfs/test-ns_test-name test-dst"},
+			},
+			msg: "app protect policy and log conf",
+		},
+	}
+
+	conf, err := createTestConfigurator()
+	if err != nil {
+		t.Errorf("Failed to create a test configurator: %v", err)
+	}
+
+	for _, test := range tests {
+		result := conf.updateApResources(test.ingEx)
+		if !reflect.DeepEqual(result, test.expected) {
+			t.Errorf("updateApResources() returned \n%v but exexpected\n%v for the case of %s", result, test.expected, test.msg)
+		}
+	}
+}
+
+func TestUpdateApResourcesForVs(t *testing.T) {
+	apPolRefs := map[string]*unstructured.Unstructured{
+		"test-ns-1/test-name-1": {
+			Object: map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"namespace": "test-ns-1",
+					"name":      "test-name-1",
+				},
+			},
+		},
+		"test-ns-2/test-name-2": {
+			Object: map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"namespace": "test-ns-2",
+					"name":      "test-name-2",
+				},
+			},
+		},
+	}
+	logConfRefs := map[string]*unstructured.Unstructured{
+		"test-ns-1/test-name-1": {
+			Object: map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"namespace": "test-ns-1",
+					"name":      "test-name-1",
+				},
+			},
+		},
+		"test-ns-2/test-name-2": {
+			Object: map[string]interface{}{
+				"metadata": map[string]interface{}{
+					"namespace": "test-ns-2",
+					"name":      "test-name-2",
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		vsEx     *VirtualServerEx
+		expected map[string]string
+		msg      string
+	}{
+		{
+			vsEx: &VirtualServerEx{
+				VirtualServer: &conf_v1.VirtualServer{
+					ObjectMeta: meta_v1.ObjectMeta{},
+				},
+			},
+			expected: map[string]string{},
+			msg:      "no app protect resources",
+		},
+		{
+			vsEx: &VirtualServerEx{
+				VirtualServer: &conf_v1.VirtualServer{
+					ObjectMeta: meta_v1.ObjectMeta{},
+				},
+				ApPolRefs: apPolRefs,
+			},
+			expected: map[string]string{
+				"test-ns-1/test-name-1": "/etc/nginx/waf/nac-policies/test-ns-1_test-name-1",
+				"test-ns-2/test-name-2": "/etc/nginx/waf/nac-policies/test-ns-2_test-name-2",
+			},
+			msg: "app protect policies",
+		},
+		{
+			vsEx: &VirtualServerEx{
+				VirtualServer: &conf_v1.VirtualServer{
+					ObjectMeta: meta_v1.ObjectMeta{},
+				},
+				LogConfRefs: logConfRefs,
+			},
+			expected: map[string]string{
+				"test-ns-1/test-name-1": "/etc/nginx/waf/nac-logconfs/test-ns-1_test-name-1",
+				"test-ns-2/test-name-2": "/etc/nginx/waf/nac-logconfs/test-ns-2_test-name-2",
+			},
+			msg: "app protect log confs",
+		},
+		{
+			vsEx: &VirtualServerEx{
+				VirtualServer: &conf_v1.VirtualServer{
+					ObjectMeta: meta_v1.ObjectMeta{},
+				},
+				ApPolRefs:   apPolRefs,
+				LogConfRefs: logConfRefs,
+			},
+			expected: map[string]string{
+				// this is a bug - the result needs to include both policies and log confs
+				"test-ns-1/test-name-1": "/etc/nginx/waf/nac-logconfs/test-ns-1_test-name-1",
+				"test-ns-2/test-name-2": "/etc/nginx/waf/nac-logconfs/test-ns-2_test-name-2",
+			},
+			msg: "app protect policies and log confs",
+		},
+	}
+
+	conf, err := createTestConfigurator()
+	if err != nil {
+		t.Errorf("Failed to create a test configurator: %v", err)
+	}
+
+	for _, test := range tests {
+		result := conf.updateApResourcesForVs(test.vsEx)
+		if !reflect.DeepEqual(result, test.expected) {
+			t.Errorf("updateApResourcesForVs() returned \n%v but exexpected\n%v for the case of %s", result, test.expected, test.msg)
+		}
 	}
 }

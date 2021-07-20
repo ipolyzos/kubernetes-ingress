@@ -10,7 +10,7 @@ from suite.resources_utils import get_first_pod_name, get_events, \
     wait_before_test, replace_configmap_from_yaml, create_service_from_yaml, \
     delete_namespace, create_namespace_with_name_from_yaml, read_service, replace_service, replace_configmap, \
     create_service_with_name, create_deployment_with_name, ensure_response_from_backend
-from suite.yaml_utils import get_paths_from_vsr_yaml, get_route_namespace_from_vs_yaml, get_first_vs_host_from_yaml
+from suite.yaml_utils import get_paths_from_vsr_yaml, get_route_namespace_from_vs_yaml, get_first_host_from_yaml
 
 
 class ReducedVirtualServerRouteSetup:
@@ -65,7 +65,7 @@ def vsr_externalname_setup(request, kube_apis,
     vs_name = create_virtual_server_from_yaml(kube_apis.custom_objects,
                                               f"{TEST_DATA}/{request.param['example']}/standard/virtual-server.yaml",
                                               ns_1)
-    vs_host = get_first_vs_host_from_yaml(f"{TEST_DATA}/{request.param['example']}/standard/virtual-server.yaml")
+    vs_host = get_first_host_from_yaml(f"{TEST_DATA}/{request.param['example']}/standard/virtual-server.yaml")
 
     print("------------------------- Deploy Virtual Server Route -----------------------------------")
     vsr_name = create_v_s_route_from_yaml(kube_apis.custom_objects,
@@ -138,7 +138,7 @@ class TestVSRWithExternalNameService:
         vsr_event_text = f"Configuration for {text_vsr} was added or updated"
         vsr_event_warning_text = f"Configuration for {text_vsr} was added or updated with warning(s):"
         vs_event_text = f"Configuration for {text_vs} was added or updated"
-        wait_before_test(5)
+        wait_before_test(10)
         initial_events = get_events(kube_apis.v1, vsr_externalname_setup.route.namespace)
         initial_count_vsr = assert_event_and_get_count(vsr_event_text, initial_events)
         initial_warning_count_vsr = assert_event_and_get_count(vsr_event_warning_text, initial_events)
@@ -149,7 +149,7 @@ class TestVSRWithExternalNameService:
         external_svc.spec.external_name = "demo.nginx.com"
         replace_service(kube_apis.v1,
                         vsr_externalname_setup.external_svc, vsr_externalname_setup.namespace, external_svc)
-        wait_before_test(5)
+        wait_before_test(10)
 
         wait_for_event_count_increases(kube_apis, vsr_event_text,
                                        initial_count_vsr, vsr_externalname_setup.route.namespace)
@@ -162,7 +162,7 @@ class TestVSRWithExternalNameService:
         replace_configmap(kube_apis.v1, config_map_name,
                           ingress_controller_prerequisites.namespace,
                           ingress_controller_prerequisites.config_map)
-        wait_before_test(5)
+        wait_before_test(10)
 
         events_step_2 = get_events(kube_apis.v1, vsr_externalname_setup.route.namespace)
         assert_event_and_count(vsr_event_warning_text, initial_warning_count_vsr + 1, events_step_2)

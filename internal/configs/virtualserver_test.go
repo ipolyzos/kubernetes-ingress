@@ -1,15 +1,17 @@
 package configs
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/nginxinc/kubernetes-ingress/internal/configs/version2"
+	"github.com/nginxinc/kubernetes-ingress/internal/k8s/secrets"
 	"github.com/nginxinc/kubernetes-ingress/internal/nginx"
 	conf_v1 "github.com/nginxinc/kubernetes-ingress/pkg/apis/configuration/v1"
-	conf_v1alpha1 "github.com/nginxinc/kubernetes-ingress/pkg/apis/configuration/v1alpha1"
+	api_v1 "k8s.io/api/core/v1"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
@@ -135,7 +137,11 @@ func TestVariableNamerSafeNsName(t *testing.T) {
 	variableNamer := newVariableNamer(&virtualServer)
 
 	if variableNamer.safeNsName != expected {
-		t.Errorf("newVariableNamer() returned variableNamer with safeNsName=%q but expected %q", variableNamer.safeNsName, expected)
+		t.Errorf(
+			"newVariableNamer() returned variableNamer with safeNsName=%q but expected %q",
+			variableNamer.safeNsName,
+			expected,
+		)
 	}
 }
 
@@ -476,11 +482,13 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 				Keepalive: 16,
 			},
 		},
-		HTTPSnippets:  []string{""},
+		HTTPSnippets:  []string{},
 		LimitReqZones: []version2.LimitReqZone{},
 		Server: version2.Server{
 			ServerName:      "cafe.example.com",
 			StatusZone:      "cafe.example.com",
+			VSNamespace:     "default",
+			VSName:          "cafe",
 			ProxyProtocol:   true,
 			ServerTokens:    "off",
 			SetRealIPFrom:   []string{"0.0.0.0/0"},
@@ -498,6 +506,8 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 					HasKeepalive:             true,
 					ProxySSLName:             "tea-svc.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "tea-svc",
 				},
 				{
 					Path:                     "/tea-latest",
@@ -508,6 +518,8 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 					HasKeepalive:             true,
 					ProxySSLName:             "tea-svc.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "tea-svc",
 				},
 				// Order changes here because we generate first all the VS Routes and then all the VSR Subroutes (separated for loops)
 				{
@@ -527,6 +539,8 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 					},
 					ProxySSLName:            "coffee-svc.default.svc",
 					ProxyPassRequestHeaders: true,
+					ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:             "coffee-svc",
 				},
 				{
 					Path:                     "/coffee",
@@ -537,6 +551,11 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 					HasKeepalive:             true,
 					ProxySSLName:             "coffee-svc.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "coffee-svc",
+					IsVSR:                    true,
+					VSRName:                  "coffee",
+					VSRNamespace:             "default",
 				},
 				{
 					Path:                     "/subtea",
@@ -547,6 +566,11 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 					HasKeepalive:             true,
 					ProxySSLName:             "sub-tea-svc.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "sub-tea-svc",
+					IsVSR:                    true,
+					VSRName:                  "subtea",
+					VSRNamespace:             "default",
 				},
 
 				{
@@ -566,6 +590,11 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 					},
 					ProxySSLName:            "coffee-svc.default.svc",
 					ProxyPassRequestHeaders: true,
+					ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:             "coffee-svc",
+					IsVSR:                   true,
+					VSRName:                 "subcoffee",
+					VSRNamespace:            "default",
 				},
 				{
 					Path:                     "/coffee-errorpage-subroute-defined",
@@ -584,6 +613,11 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 					},
 					ProxySSLName:            "coffee-svc.default.svc",
 					ProxyPassRequestHeaders: true,
+					ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:             "coffee-svc",
+					IsVSR:                   true,
+					VSRName:                 "subcoffee",
+					VSRNamespace:            "default",
 				},
 			},
 			ErrorPageLocations: []version2.ErrorPageLocation{
@@ -600,14 +634,16 @@ func TestGenerateVirtualServerConfig(t *testing.T) {
 
 	isPlus := false
 	isResolverConfigured := false
-	tlsPemFileName := ""
-	ingressMTLSFileName := ""
-	vsc := newVirtualServerConfigurator(&baseCfgParams, isPlus, isResolverConfigured, &StaticConfigParams{TLSPassthrough: true})
-	jwtKeys := make(map[string]string)
-	egressMTLSSecrets := make(map[string]string)
-	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, tlsPemFileName, jwtKeys, ingressMTLSFileName, egressMTLSSecrets)
-	if !reflect.DeepEqual(result, expected) {
-		t.Errorf("GenerateVirtualServerConfig returned \n%+v but expected \n%+v", result, expected)
+	vsc := newVirtualServerConfigurator(
+		&baseCfgParams,
+		isPlus,
+		isResolverConfigured,
+		&StaticConfigParams{TLSPassthrough: true},
+	)
+
+	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, nil)
+	if diff := cmp.Diff(expected, result); diff != "" {
+		t.Errorf("GenerateVirtualServerConfig() mismatch (-want +got):\n%s", diff)
 	}
 
 	if len(warnings) != 0 {
@@ -676,11 +712,13 @@ func TestGenerateVirtualServerConfigWithSpiffeCerts(t *testing.T) {
 				Keepalive: 16,
 			},
 		},
-		HTTPSnippets:  []string{""},
+		HTTPSnippets:  []string{},
 		LimitReqZones: []version2.LimitReqZone{},
 		Server: version2.Server{
 			ServerName:      "cafe.example.com",
 			StatusZone:      "cafe.example.com",
+			VSNamespace:     "default",
+			VSName:          "cafe",
 			ProxyProtocol:   true,
 			ServerTokens:    "off",
 			SetRealIPFrom:   []string{"0.0.0.0/0"},
@@ -698,6 +736,8 @@ func TestGenerateVirtualServerConfigWithSpiffeCerts(t *testing.T) {
 					HasKeepalive:             true,
 					ProxySSLName:             "tea-svc.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "tea-svc",
 				},
 			},
 		},
@@ -706,21 +746,19 @@ func TestGenerateVirtualServerConfigWithSpiffeCerts(t *testing.T) {
 
 	isPlus := false
 	isResolverConfigured := false
-	tlsPemFileName := ""
 	staticConfigParams := &StaticConfigParams{TLSPassthrough: true, NginxServiceMesh: true}
 	vsc := newVirtualServerConfigurator(&baseCfgParams, isPlus, isResolverConfigured, staticConfigParams)
-	jwtKeys := make(map[string]string)
-	egressMTLSSecrets := make(map[string]string)
-	ingressMTLSFileName := ""
-	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, tlsPemFileName, jwtKeys, ingressMTLSFileName, egressMTLSSecrets)
-	if !reflect.DeepEqual(result, expected) {
-		t.Errorf("GenerateVirtualServerConfig returned \n%+v but expected \n%+v", result, expected)
+
+	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, nil)
+	if diff := cmp.Diff(expected, result); diff != "" {
+		t.Errorf("GenerateVirtualServerConfig() mismatch (-want +got):\n%s", diff)
 	}
 
 	if len(warnings) != 0 {
 		t.Errorf("GenerateVirtualServerConfig returned warnings: %v", vsc.warnings)
 	}
 }
+
 func TestGenerateVirtualServerConfigForVirtualServerWithSplits(t *testing.T) {
 	virtualServerEx := VirtualServerEx{
 		VirtualServer: &conf_v1.VirtualServer{
@@ -916,11 +954,13 @@ func TestGenerateVirtualServerConfigForVirtualServerWithSplits(t *testing.T) {
 				},
 			},
 		},
-		HTTPSnippets:  []string{""},
+		HTTPSnippets:  []string{},
 		LimitReqZones: []version2.LimitReqZone{},
 		Server: version2.Server{
-			ServerName: "cafe.example.com",
-			StatusZone: "cafe.example.com",
+			ServerName:  "cafe.example.com",
+			StatusZone:  "cafe.example.com",
+			VSNamespace: "default",
+			VSName:      "cafe",
 			InternalRedirectLocations: []version2.InternalRedirectLocation{
 				{
 					Path:        "/tea",
@@ -941,6 +981,8 @@ func TestGenerateVirtualServerConfigForVirtualServerWithSplits(t *testing.T) {
 					Internal:                 true,
 					ProxySSLName:             "tea-svc-v1.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "tea-svc-v1",
 				},
 				{
 					Path:                     "/internal_location_splits_0_split_1",
@@ -951,6 +993,8 @@ func TestGenerateVirtualServerConfigForVirtualServerWithSplits(t *testing.T) {
 					Internal:                 true,
 					ProxySSLName:             "tea-svc-v2.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "tea-svc-v2",
 				},
 				{
 					Path:                     "/internal_location_splits_1_split_0",
@@ -961,6 +1005,11 @@ func TestGenerateVirtualServerConfigForVirtualServerWithSplits(t *testing.T) {
 					Internal:                 true,
 					ProxySSLName:             "coffee-svc-v1.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "coffee-svc-v1",
+					IsVSR:                    true,
+					VSRName:                  "coffee",
+					VSRNamespace:             "default",
 				},
 				{
 					Path:                     "/internal_location_splits_1_split_1",
@@ -971,6 +1020,11 @@ func TestGenerateVirtualServerConfigForVirtualServerWithSplits(t *testing.T) {
 					Internal:                 true,
 					ProxySSLName:             "coffee-svc-v2.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "coffee-svc-v2",
+					IsVSR:                    true,
+					VSRName:                  "coffee",
+					VSRNamespace:             "default",
 				},
 			},
 		},
@@ -978,14 +1032,11 @@ func TestGenerateVirtualServerConfigForVirtualServerWithSplits(t *testing.T) {
 
 	isPlus := false
 	isResolverConfigured := false
-	tlsPemFileName := ""
 	vsc := newVirtualServerConfigurator(&baseCfgParams, isPlus, isResolverConfigured, &StaticConfigParams{})
-	jwtKeys := make(map[string]string)
-	egressMTLSSecrets := make(map[string]string)
-	ingressMTLSFileName := ""
-	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, tlsPemFileName, jwtKeys, ingressMTLSFileName, egressMTLSSecrets)
-	if !reflect.DeepEqual(result, expected) {
-		t.Errorf("GenerateVirtualServerConfig returned \n%+v but expected \n%+v", result, expected)
+
+	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, nil)
+	if diff := cmp.Diff(expected, result); diff != "" {
+		t.Errorf("GenerateVirtualServerConfig() mismatch (-want +got):\n%s", diff)
 	}
 
 	if len(warnings) != 0 {
@@ -1220,11 +1271,13 @@ func TestGenerateVirtualServerConfigForVirtualServerWithMatches(t *testing.T) {
 				},
 			},
 		},
-		HTTPSnippets:  []string{""},
+		HTTPSnippets:  []string{},
 		LimitReqZones: []version2.LimitReqZone{},
 		Server: version2.Server{
-			ServerName: "cafe.example.com",
-			StatusZone: "cafe.example.com",
+			ServerName:  "cafe.example.com",
+			StatusZone:  "cafe.example.com",
+			VSNamespace: "default",
+			VSName:      "cafe",
 			InternalRedirectLocations: []version2.InternalRedirectLocation{
 				{
 					Path:        "/tea",
@@ -1245,6 +1298,8 @@ func TestGenerateVirtualServerConfigForVirtualServerWithMatches(t *testing.T) {
 					Internal:                 true,
 					ProxySSLName:             "tea-svc-v2.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "tea-svc-v2",
 				},
 				{
 					Path:                     "/internal_location_matches_0_default",
@@ -1255,6 +1310,8 @@ func TestGenerateVirtualServerConfigForVirtualServerWithMatches(t *testing.T) {
 					Internal:                 true,
 					ProxySSLName:             "tea-svc-v1.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "tea-svc-v1",
 				},
 				{
 					Path:                     "/internal_location_matches_1_match_0",
@@ -1265,6 +1322,11 @@ func TestGenerateVirtualServerConfigForVirtualServerWithMatches(t *testing.T) {
 					Internal:                 true,
 					ProxySSLName:             "coffee-svc-v2.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "coffee-svc-v2",
+					IsVSR:                    true,
+					VSRName:                  "coffee",
+					VSRNamespace:             "default",
 				},
 				{
 					Path:                     "/internal_location_matches_1_default",
@@ -1275,6 +1337,11 @@ func TestGenerateVirtualServerConfigForVirtualServerWithMatches(t *testing.T) {
 					Internal:                 true,
 					ProxySSLName:             "coffee-svc-v1.default.svc",
 					ProxyPassRequestHeaders:  true,
+					ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+					ServiceName:              "coffee-svc-v1",
+					IsVSR:                    true,
+					VSRName:                  "coffee",
+					VSRNamespace:             "default",
 				},
 			},
 		},
@@ -1282,14 +1349,11 @@ func TestGenerateVirtualServerConfigForVirtualServerWithMatches(t *testing.T) {
 
 	isPlus := false
 	isResolverConfigured := false
-	tlsPemFileName := ""
 	vsc := newVirtualServerConfigurator(&baseCfgParams, isPlus, isResolverConfigured, &StaticConfigParams{})
-	jwtKeys := make(map[string]string)
-	egressMTLSSecrets := make(map[string]string)
-	ingressMTLSFileName := ""
-	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, tlsPemFileName, jwtKeys, ingressMTLSFileName, egressMTLSSecrets)
-	if !reflect.DeepEqual(result, expected) {
-		t.Errorf("GenerateVirtualServerConfig returned \n%+v but expected \n%+v", result, expected)
+
+	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, nil)
+	if diff := cmp.Diff(expected, result); diff != "" {
+		t.Errorf("GenerateVirtualServerConfig() mismatch (-want +got):\n%s", diff)
 	}
 
 	if len(warnings) != 0 {
@@ -1524,11 +1588,13 @@ func TestGenerateVirtualServerConfigForVirtualServerWithReturns(t *testing.T) {
 				},
 			},
 		},
-		HTTPSnippets:  []string{""},
+		HTTPSnippets:  []string{},
 		LimitReqZones: []version2.LimitReqZone{},
 		Server: version2.Server{
-			ServerName: "example.com",
-			StatusZone: "example.com",
+			ServerName:  "example.com",
+			StatusZone:  "example.com",
+			VSNamespace: "default",
+			VSName:      "returns",
 			InternalRedirectLocations: []version2.InternalRedirectLocation{
 				{
 					Path:        "/splits-with-return",
@@ -1756,12 +1822,9 @@ func TestGenerateVirtualServerConfigForVirtualServerWithReturns(t *testing.T) {
 
 	isPlus := false
 	isResolverConfigured := false
-	tlsPemFileName := ""
 	vsc := newVirtualServerConfigurator(&baseCfgParams, isPlus, isResolverConfigured, &StaticConfigParams{})
-	jwtKeys := make(map[string]string)
-	egressMTLSSecrets := make(map[string]string)
-	ingressMTLSFileName := ""
-	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, tlsPemFileName, jwtKeys, ingressMTLSFileName, egressMTLSSecrets)
+
+	result, warnings := vsc.GenerateVirtualServerConfig(&virtualServerEx, nil)
 	if !reflect.DeepEqual(result, expected) {
 		t.Errorf("GenerateVirtualServerConfig returned \n%+v but expected \n%+v", result, expected)
 	}
@@ -1772,21 +1835,62 @@ func TestGenerateVirtualServerConfigForVirtualServerWithReturns(t *testing.T) {
 }
 
 func TestGeneratePolicies(t *testing.T) {
-	var owner runtime.Object // nil is OK for the unit test
-	ownerNamespace := "default"
-	vsNamespace := "default"
-	vsName := "test"
+	ownerDetails := policyOwnerDetails{
+		owner:          nil, // nil is OK for the unit test
+		ownerNamespace: "default",
+		vsNamespace:    "default",
+		vsName:         "test",
+	}
 	ingressMTLSCertPath := "/etc/nginx/secrets/default-ingress-mtls-secret"
-	tlsPemFileName := "/etc/nginx/secrets/default-tls-secret"
+	policyOpts := policyOptions{
+		tls: true,
+		secretRefs: map[string]*secrets.SecretReference{
+			"default/ingress-mtls-secret": {
+				Secret: &api_v1.Secret{
+					Type: secrets.SecretTypeCA,
+				},
+				Path: ingressMTLSCertPath,
+			},
+			"default/egress-mtls-secret": {
+				Secret: &api_v1.Secret{
+					Type: api_v1.SecretTypeTLS,
+				},
+				Path: "/etc/nginx/secrets/default-egress-mtls-secret",
+			},
+			"default/egress-trusted-ca-secret": {
+				Secret: &api_v1.Secret{
+					Type: secrets.SecretTypeCA,
+				},
+				Path: "/etc/nginx/secrets/default-egress-trusted-ca-secret",
+			},
+			"default/jwt-secret": {
+				Secret: &api_v1.Secret{
+					Type: secrets.SecretTypeJWK,
+				},
+				Path: "/etc/nginx/secrets/default-jwt-secret",
+			},
+			"default/oidc-secret": {
+				Secret: &api_v1.Secret{
+					Type: secrets.SecretTypeOIDC,
+					Data: map[string][]byte{
+						"client-secret": []byte("super_secret_123"),
+					},
+				},
+			},
+		},
+		apResources: map[string]string{
+			"default/logconf":         "/etc/nginx/waf/nac-logconfs/default-logconf",
+			"default/dataguard-alarm": "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+		},
+	}
 
 	tests := []struct {
-		policyRefs        []conf_v1.PolicyReference
-		policies          map[string]*conf_v1alpha1.Policy
-		jwtKeys           map[string]string
-		egressMTLSSecrets map[string]string
-		context           string
-		expected          policiesCfg
-		msg               string
+		policyRefs []conf_v1.PolicyReference
+		policies   map[string]*conf_v1.Policy
+		policyOpts policyOptions
+		context    string
+		expected   policiesCfg
+		msg        string
 	}{
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -1795,16 +1899,15 @@ func TestGeneratePolicies(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/allow-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						AccessControl: &conf_v1alpha1.AccessControl{
+					Spec: conf_v1.PolicySpec{
+						AccessControl: &conf_v1.AccessControl{
 							Allow: []string{"127.0.0.1"},
 						},
 					},
 				},
 			},
-			jwtKeys: nil,
 			expected: policiesCfg{
 				Allow: []string{"127.0.0.1"},
 			},
@@ -1816,10 +1919,10 @@ func TestGeneratePolicies(t *testing.T) {
 					Name: "allow-policy",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/allow-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						AccessControl: &conf_v1alpha1.AccessControl{
+					Spec: conf_v1.PolicySpec{
+						AccessControl: &conf_v1.AccessControl{
 							Allow: []string{"127.0.0.1"},
 						},
 					},
@@ -1839,23 +1942,22 @@ func TestGeneratePolicies(t *testing.T) {
 					Name: "allow-policy-2",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/allow-policy-1": {
-					Spec: conf_v1alpha1.PolicySpec{
-						AccessControl: &conf_v1alpha1.AccessControl{
+					Spec: conf_v1.PolicySpec{
+						AccessControl: &conf_v1.AccessControl{
 							Allow: []string{"127.0.0.1"},
 						},
 					},
 				},
 				"default/allow-policy-2": {
-					Spec: conf_v1alpha1.PolicySpec{
-						AccessControl: &conf_v1alpha1.AccessControl{
+					Spec: conf_v1.PolicySpec{
+						AccessControl: &conf_v1.AccessControl{
 							Allow: []string{"127.0.0.2"},
 						},
 					},
 				},
 			},
-			jwtKeys: nil,
 			expected: policiesCfg{
 				Allow: []string{"127.0.0.1", "127.0.0.2"},
 			},
@@ -1868,10 +1970,10 @@ func TestGeneratePolicies(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/rateLimit-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						RateLimit: &conf_v1alpha1.RateLimit{
+					Spec: conf_v1.PolicySpec{
+						RateLimit: &conf_v1.RateLimit{
 							Key:      "test",
 							ZoneSize: "10M",
 							Rate:     "10r/s",
@@ -1880,7 +1982,6 @@ func TestGeneratePolicies(t *testing.T) {
 					},
 				},
 			},
-			jwtKeys: nil,
 			expected: policiesCfg{
 				LimitReqZones: []version2.LimitReqZone{
 					{
@@ -1913,10 +2014,10 @@ func TestGeneratePolicies(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/rateLimit-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						RateLimit: &conf_v1alpha1.RateLimit{
+					Spec: conf_v1.PolicySpec{
+						RateLimit: &conf_v1.RateLimit{
 							Key:      "test",
 							ZoneSize: "10M",
 							Rate:     "10r/s",
@@ -1924,8 +2025,8 @@ func TestGeneratePolicies(t *testing.T) {
 					},
 				},
 				"default/rateLimit-policy2": {
-					Spec: conf_v1alpha1.PolicySpec{
-						RateLimit: &conf_v1alpha1.RateLimit{
+					Spec: conf_v1.PolicySpec{
+						RateLimit: &conf_v1.RateLimit{
 							Key:      "test2",
 							ZoneSize: "20M",
 							Rate:     "20r/s",
@@ -1933,7 +2034,6 @@ func TestGeneratePolicies(t *testing.T) {
 					},
 				},
 			},
-			jwtKeys: nil,
 			expected: policiesCfg{
 				LimitReqZones: []version2.LimitReqZone{
 					{
@@ -1971,18 +2071,19 @@ func TestGeneratePolicies(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/jwt-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						JWTAuth: &conf_v1alpha1.JWTAuth{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "jwt-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						JWTAuth: &conf_v1.JWTAuth{
 							Realm:  "My Test API",
 							Secret: "jwt-secret",
 						},
 					},
 				},
-			},
-			jwtKeys: map[string]string{
-				"default/jwt-secret": "/etc/nginx/secrets/default-jwt-secret",
 			},
 			expected: policiesCfg{
 				JWTAuth: &version2.JWTAuth{
@@ -1999,17 +2100,20 @@ func TestGeneratePolicies(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/ingress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						IngressMTLS: &conf_v1alpha1.IngressMTLS{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "ingress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						IngressMTLS: &conf_v1.IngressMTLS{
 							ClientCertSecret: "ingress-mtls-secret",
 							VerifyClient:     "off",
 						},
 					},
 				},
 			},
-			jwtKeys: nil,
 			context: "spec",
 			expected: policiesCfg{
 				IngressMTLS: &version2.IngressMTLS{
@@ -2027,10 +2131,10 @@ func TestGeneratePolicies(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/egress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						EgressMTLS: &conf_v1alpha1.EgressMTLS{
+					Spec: conf_v1.PolicySpec{
+						EgressMTLS: &conf_v1.EgressMTLS{
 							TLSSecret:         "egress-mtls-secret",
 							ServerName:        true,
 							SessionReuse:      createPointerFromBool(false),
@@ -2038,11 +2142,6 @@ func TestGeneratePolicies(t *testing.T) {
 						},
 					},
 				},
-			},
-			jwtKeys: nil,
-			egressMTLSSecrets: map[string]string{
-				"default/egress-mtls-secret":       "/etc/nginx/secrets/default-egress-mtls-secret",
-				"default/egress-trusted-ca-secret": "/etc/nginx/secrets/default-egress-trusted-ca-secret",
 			},
 			context: "route",
 			expected: policiesCfg{
@@ -2061,12 +2160,76 @@ func TestGeneratePolicies(t *testing.T) {
 			},
 			msg: "egressMTLS reference",
 		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "oidc-policy",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/oidc-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "oidc-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						OIDC: &conf_v1.OIDC{
+							AuthEndpoint:  "http://example.com/auth",
+							TokenEndpoint: "http://example.com/token",
+							JWKSURI:       "http://example.com/jwks",
+							ClientID:      "client-id",
+							ClientSecret:  "oidc-secret",
+							Scope:         "scope",
+							RedirectURI:   "/redirect",
+						},
+					},
+				},
+			},
+			expected: policiesCfg{
+				OIDC: true,
+			},
+			msg: "oidc reference",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "waf-policy",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/waf-policy": {
+					Spec: conf_v1.PolicySpec{
+						WAF: &conf_v1.WAF{
+							Enable:   true,
+							ApPolicy: "default/dataguard-alarm",
+							SecurityLog: &conf_v1.SecurityLog{
+								Enable:    true,
+								ApLogConf: "default/logconf",
+								LogDest:   "syslog:server=127.0.0.1:514",
+							},
+						},
+					},
+				},
+			},
+			context: "route",
+			expected: policiesCfg{
+				WAF: &version2.WAF{
+					Enable:              "on",
+					ApPolicy:            "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+					ApSecurityLogEnable: true,
+					ApLogConf:           "/etc/nginx/waf/nac-logconfs/default-logconf syslog:server=127.0.0.1:514",
+				},
+			},
+			msg: "WAF reference",
+		},
 	}
 
 	vsc := newVirtualServerConfigurator(&ConfigParams{}, false, false, &StaticConfigParams{})
 
 	for _, test := range tests {
-		result := vsc.generatePolicies(owner, ownerNamespace, vsNamespace, vsName, test.policyRefs, test.policies, test.jwtKeys, ingressMTLSCertPath, test.context, tlsPemFileName, test.egressMTLSSecrets)
+		result := vsc.generatePolicies(ownerDetails, test.policyRefs, test.policies, test.context, policyOpts)
 		if diff := cmp.Diff(test.expected, result); diff != "" {
 			t.Errorf("generatePolicies() '%v' mismatch (-want +got):\n%s", test.msg, diff)
 		}
@@ -2077,26 +2240,27 @@ func TestGeneratePolicies(t *testing.T) {
 }
 
 func TestGeneratePoliciesFails(t *testing.T) {
-	var owner runtime.Object // nil is OK for the unit test
-	ownerNamespace := "default"
-	vsNamespace := "default"
-	vsName := "test"
+	ownerDetails := policyOwnerDetails{
+		owner:          nil, // nil is OK for the unit test
+		ownerNamespace: "default",
+		vsNamespace:    "default",
+		vsName:         "test",
+	}
 
 	dryRunOverride := true
 	rejectCodeOverride := 505
 
 	tests := []struct {
-		policyRefs          []conf_v1.PolicyReference
-		policies            map[string]*conf_v1alpha1.Policy
-		jwtKeys             map[string]string
-		egressMTLSSecrets   map[string]string
-		ingressMTLSFileName string
-		tlsPemFileName      string
-		trustedCAFileName   string
-		context             string
-		expected            policiesCfg
-		expectedWarnings    Warnings
-		msg                 string
+		policyRefs        []conf_v1.PolicyReference
+		policies          map[string]*conf_v1.Policy
+		policyOpts        policyOptions
+		trustedCAFileName string
+		context           string
+		oidcPolCfg        *oidcPolicyCfg
+		expected          policiesCfg
+		expectedWarnings  Warnings
+		expectedOidc      *oidcPolicyCfg
+		msg               string
 	}{
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2105,19 +2269,20 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{},
-			jwtKeys:  nil,
+			policies:   map[string]*conf_v1.Policy{},
+			policyOpts: policyOptions{},
 			expected: policiesCfg{
 				ErrorReturn: &version2.Return{
 					Code: 500,
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
 					"Policy default/allow-policy is missing or invalid",
 				},
 			},
-			msg: "missing policy",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "missing policy",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2128,33 +2293,34 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Name: "deny-policy",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/allow-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						AccessControl: &conf_v1alpha1.AccessControl{
+					Spec: conf_v1.PolicySpec{
+						AccessControl: &conf_v1.AccessControl{
 							Allow: []string{"127.0.0.1"},
 						},
 					},
 				},
 				"default/deny-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						AccessControl: &conf_v1alpha1.AccessControl{
+					Spec: conf_v1.PolicySpec{
+						AccessControl: &conf_v1.AccessControl{
 							Deny: []string{"127.0.0.2"},
 						},
 					},
 				},
 			},
-			jwtKeys: nil,
+			policyOpts: policyOptions{},
 			expected: policiesCfg{
 				Allow: []string{"127.0.0.1"},
 				Deny:  []string{"127.0.0.2"},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
 					"AccessControl policy (or policies) with deny rules is overridden by policy (or policies) with allow rules",
 				},
 			},
-			msg: "conflicting policies",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "conflicting policies",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2167,10 +2333,10 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/rateLimit-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						RateLimit: &conf_v1alpha1.RateLimit{
+					Spec: conf_v1.PolicySpec{
+						RateLimit: &conf_v1.RateLimit{
 							Key:      "test",
 							ZoneSize: "10M",
 							Rate:     "10r/s",
@@ -2178,8 +2344,8 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					},
 				},
 				"default/rateLimit-policy2": {
-					Spec: conf_v1alpha1.PolicySpec{
-						RateLimit: &conf_v1alpha1.RateLimit{
+					Spec: conf_v1.PolicySpec{
+						RateLimit: &conf_v1.RateLimit{
 							Key:        "test2",
 							ZoneSize:   "20M",
 							Rate:       "20r/s",
@@ -2190,7 +2356,7 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					},
 				},
 			},
-			jwtKeys: nil,
+			policyOpts: policyOptions{},
 			expected: policiesCfg{
 				LimitReqZones: []version2.LimitReqZone{
 					{
@@ -2219,14 +2385,15 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					},
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`RateLimit policy "default/rateLimit-policy2" with limit request option dryRun=true is overridden to dryRun=false by the first policy reference in this context`,
-					`RateLimit policy "default/rateLimit-policy2" with limit request option logLevel=info is overridden to logLevel=error by the first policy reference in this context`,
-					`RateLimit policy "default/rateLimit-policy2" with limit request option rejectCode=505 is overridden to rejectCode=503 by the first policy reference in this context`,
+					`RateLimit policy default/rateLimit-policy2 with limit request option dryRun='true' is overridden to dryRun='false' by the first policy reference in this context`,
+					`RateLimit policy default/rateLimit-policy2 with limit request option logLevel='info' is overridden to logLevel='error' by the first policy reference in this context`,
+					`RateLimit policy default/rateLimit-policy2 with limit request option rejectCode='505' is overridden to rejectCode='503' by the first policy reference in this context`,
 				},
 			},
-			msg: "rate limit policy limit request option override",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "rate limit policy limit request option override",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2235,28 +2402,85 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/jwt-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						JWTAuth: &conf_v1alpha1.JWTAuth{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "jwt-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						JWTAuth: &conf_v1.JWTAuth{
 							Realm:  "test",
 							Secret: "jwt-secret",
 						},
 					},
 				},
 			},
-			jwtKeys: nil,
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/jwt-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeJWK,
+						},
+						Error: errors.New("secret is invalid"),
+					},
+				},
+			},
 			expected: policiesCfg{
 				ErrorReturn: &version2.Return{
 					Code: 500,
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`JWT policy "default/jwt-policy" references a JWKSecret "default/jwt-secret" which does not exist`,
+					`JWT policy default/jwt-policy references an invalid secret default/jwt-secret: secret is invalid`,
 				},
 			},
-			msg: "jwt reference missing secret",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "jwt reference missing secret",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "jwt-policy",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/jwt-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "jwt-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						JWTAuth: &conf_v1.JWTAuth{
+							Realm:  "test",
+							Secret: "jwt-secret",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/jwt-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeCA,
+						},
+					},
+				},
+			},
+			expected: policiesCfg{
+				ErrorReturn: &version2.Return{
+					Code: 500,
+				},
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`JWT policy default/jwt-policy references a secret default/jwt-secret of a wrong type 'nginx.org/ca', must be 'nginx.org/jwk'`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "jwt references wrong secret type",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2269,27 +2493,47 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/jwt-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						JWTAuth: &conf_v1alpha1.JWTAuth{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "jwt-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						JWTAuth: &conf_v1.JWTAuth{
 							Realm:  "test",
 							Secret: "jwt-secret",
 						},
 					},
 				},
 				"default/jwt-policy2": {
-					Spec: conf_v1alpha1.PolicySpec{
-						JWTAuth: &conf_v1alpha1.JWTAuth{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "jwt-policy2",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						JWTAuth: &conf_v1.JWTAuth{
 							Realm:  "test",
 							Secret: "jwt-secret2",
 						},
 					},
 				},
 			},
-			jwtKeys: map[string]string{
-				"default/jwt-secret":  "/etc/nginx/secrets/default-jwt-secret",
-				"default/jwt-secret2": "",
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/jwt-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeJWK,
+						},
+						Path: "/etc/nginx/secrets/default-jwt-secret",
+					},
+					"default/jwt-secret2": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeJWK,
+						},
+						Path: "/etc/nginx/secrets/default-jwt-secret2",
+					},
+				},
 			},
 			expected: policiesCfg{
 				JWTAuth: &version2.JWTAuth{
@@ -2297,12 +2541,13 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Realm:  "test",
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`Multiple jwt policies in the same context is not valid. JWT policy "default/jwt-policy2" will be ignored`,
+					`Multiple jwt policies in the same context is not valid. JWT policy default/jwt-policy2 will be ignored`,
 				},
 			},
-			msg: "multi jwt reference",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "multi jwt reference",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2311,29 +2556,84 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/ingress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						IngressMTLS: &conf_v1alpha1.IngressMTLS{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "ingress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						IngressMTLS: &conf_v1.IngressMTLS{
 							ClientCertSecret: "ingress-mtls-secret",
 						},
 					},
 				},
 			},
-			jwtKeys:        nil,
-			context:        "spec",
-			tlsPemFileName: "/etc/nginx/secrets/default-tls-secret",
+			policyOpts: policyOptions{
+				tls: true,
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/ingress-mtls-secret": {
+						Error: errors.New("secret is invalid"),
+					},
+				},
+			},
+			context: "spec",
 			expected: policiesCfg{
 				ErrorReturn: &version2.Return{
 					Code: 500,
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`IngressMTLS policy "default/ingress-mtls-policy" references a Secret which does not exist`,
+					`IngressMTLS policy "default/ingress-mtls-policy" references an invalid secret default/ingress-mtls-secret: secret is invalid`,
 				},
 			},
-			msg: "ingress mtls reference missing secret",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "ingress mtls reference an invalid secret",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "ingress-mtls-policy",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/ingress-mtls-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "ingress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						IngressMTLS: &conf_v1.IngressMTLS{
+							ClientCertSecret: "ingress-mtls-secret",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				tls: true,
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/ingress-mtls-secret": {
+						Secret: &api_v1.Secret{
+							Type: api_v1.SecretTypeTLS,
+						},
+					},
+				},
+			},
+			context: "spec",
+			expected: policiesCfg{
+				ErrorReturn: &version2.Return{
+					Code: 500,
+				},
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`IngressMTLS policy default/ingress-mtls-policy references a secret default/ingress-mtls-secret of a wrong type 'kubernetes.io/tls', must be 'nginx.org/ca'`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "ingress mtls references wrong secret type",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2346,26 +2646,38 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/ingress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						IngressMTLS: &conf_v1alpha1.IngressMTLS{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "ingress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						IngressMTLS: &conf_v1.IngressMTLS{
 							ClientCertSecret: "ingress-mtls-secret",
 						},
 					},
 				},
 				"default/ingress-mtls-policy2": {
-					Spec: conf_v1alpha1.PolicySpec{
-						IngressMTLS: &conf_v1alpha1.IngressMTLS{
+					Spec: conf_v1.PolicySpec{
+						IngressMTLS: &conf_v1.IngressMTLS{
 							ClientCertSecret: "ingress-mtls-secret2",
 						},
 					},
 				},
 			},
-			jwtKeys:             nil,
-			context:             "spec",
-			ingressMTLSFileName: "/etc/nginx/secrets/default-ingress-mtls-secret",
-			tlsPemFileName:      "/etc/nginx/secrets/default-tls-secret",
+			policyOpts: policyOptions{
+				tls: true,
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/ingress-mtls-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeCA,
+						},
+						Path: "/etc/nginx/secrets/default-ingress-mtls-secret",
+					},
+				},
+			},
+			context: "spec",
 			expected: policiesCfg{
 				IngressMTLS: &version2.IngressMTLS{
 					ClientCert:   "/etc/nginx/secrets/default-ingress-mtls-secret",
@@ -2373,12 +2685,13 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					VerifyDepth:  1,
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`Multiple ingressMTLS policies are not allowed. IngressMTLS policy "default/ingress-mtls-policy2" will be ignored`,
+					`Multiple ingressMTLS policies are not allowed. IngressMTLS policy default/ingress-mtls-policy2 will be ignored`,
 				},
 			},
-			msg: "multi ingress mtls",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "multi ingress mtls",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2387,30 +2700,43 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/ingress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						IngressMTLS: &conf_v1alpha1.IngressMTLS{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "ingress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						IngressMTLS: &conf_v1.IngressMTLS{
 							ClientCertSecret: "ingress-mtls-secret",
 						},
 					},
 				},
 			},
-			jwtKeys:             nil,
-			ingressMTLSFileName: "/etc/nginx/secrets/default-ingress-mtls-secret",
-			tlsPemFileName:      "/etc/nginx/secrets/default-tls-secret",
-			context:             "route",
+			policyOpts: policyOptions{
+				tls: true,
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/ingress-mtls-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeCA,
+						},
+						Path: "/etc/nginx/secrets/default-ingress-mtls-secret",
+					},
+				},
+			},
+			context: "route",
 			expected: policiesCfg{
 				ErrorReturn: &version2.Return{
 					Code: 500,
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`IngressMTLS policy is not allowed in the route context`,
+					`IngressMTLS policy default/ingress-mtls-policy is not allowed in the route context`,
 				},
 			},
-			msg: "ingress mtls in the wrong context",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "ingress mtls in the wrong context",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2419,29 +2745,43 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/ingress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						IngressMTLS: &conf_v1alpha1.IngressMTLS{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "ingress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						IngressMTLS: &conf_v1.IngressMTLS{
 							ClientCertSecret: "ingress-mtls-secret",
 						},
 					},
 				},
 			},
-			jwtKeys:             nil,
-			ingressMTLSFileName: "/etc/nginx/secrets/default-ingress-mtls-secret",
-			context:             "route",
+			policyOpts: policyOptions{
+				tls: false,
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/ingress-mtls-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeCA,
+						},
+						Path: "/etc/nginx/secrets/default-ingress-mtls-secret",
+					},
+				},
+			},
+			context: "route",
 			expected: policiesCfg{
 				ErrorReturn: &version2.Return{
 					Code: 500,
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`TLS configuration needed for IngressMTLS policy`,
+					`TLS must be enabled in VirtualServer for IngressMTLS policy default/ingress-mtls-policy`,
 				},
 			},
-			msg: "ingress mtls missing TLS config",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "ingress mtls missing TLS config",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2454,27 +2794,41 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/egress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						EgressMTLS: &conf_v1alpha1.EgressMTLS{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "egress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						EgressMTLS: &conf_v1.EgressMTLS{
 							TLSSecret: "egress-mtls-secret",
 						},
 					},
 				},
 				"default/egress-mtls-policy2": {
-					Spec: conf_v1alpha1.PolicySpec{
-						EgressMTLS: &conf_v1alpha1.EgressMTLS{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "egress-mtls-policy2",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						EgressMTLS: &conf_v1.EgressMTLS{
 							TLSSecret: "egress-mtls-secret2",
 						},
 					},
 				},
 			},
-			jwtKeys: nil,
-			context: "route",
-			egressMTLSSecrets: map[string]string{
-				"default/egress-mtls-secret": "/etc/nginx/secrets/default-egress-mtls-secret",
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/egress-mtls-secret": {
+						Secret: &api_v1.Secret{
+							Type: api_v1.SecretTypeTLS,
+						},
+						Path: "/etc/nginx/secrets/default-egress-mtls-secret",
+					},
+				},
 			},
+			context: "route",
 			expected: policiesCfg{
 				EgressMTLS: &version2.EgressMTLS{
 					Certificate:    "/etc/nginx/secrets/default-egress-mtls-secret",
@@ -2487,12 +2841,13 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					SSLName:        "$proxy_host",
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`Multiple egressMTLS policies in the same context is not valid. EgressMTLS policy "default/egress-mtls-policy2" will be ignored`,
+					`Multiple egressMTLS policies in the same context is not valid. EgressMTLS policy default/egress-mtls-policy2 will be ignored`,
 				},
 			},
-			msg: "multi egress mtls",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "multi egress mtls",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2501,32 +2856,43 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/egress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						EgressMTLS: &conf_v1alpha1.EgressMTLS{
-							TrustedCertSecret: "egress-tusted-secret",
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "egress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						EgressMTLS: &conf_v1.EgressMTLS{
+							TrustedCertSecret: "egress-trusted-secret",
 							SSLName:           "foo.com",
 						},
 					},
 				},
 			},
-			jwtKeys: nil,
-			context: "route",
-			egressMTLSSecrets: map[string]string{
-				"default/egress-mtls-secret": "/etc/nginx/secrets/default-egress-mtls-secret",
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/egress-trusted-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeCA,
+						},
+						Error: errors.New("secret is invalid"),
+					},
+				},
 			},
+			context: "route",
 			expected: policiesCfg{
 				ErrorReturn: &version2.Return{
 					Code: 500,
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`EgressMTLS policy "default/egress-mtls-policy" references a Secret which does not exist`,
+					`EgressMTLS policy default/egress-mtls-policy references an invalid secret default/egress-trusted-secret: secret is invalid`,
 				},
 			},
-			msg: "egress mtls referencing missing CA secret",
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "egress mtls referencing an invalid CA secret",
 		},
 		{
 			policyRefs: []conf_v1.PolicyReference{
@@ -2535,44 +2901,472 @@ func TestGeneratePoliciesFails(t *testing.T) {
 					Namespace: "default",
 				},
 			},
-			policies: map[string]*conf_v1alpha1.Policy{
+			policies: map[string]*conf_v1.Policy{
 				"default/egress-mtls-policy": {
-					Spec: conf_v1alpha1.PolicySpec{
-						EgressMTLS: &conf_v1alpha1.EgressMTLS{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "egress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						EgressMTLS: &conf_v1.EgressMTLS{
 							TLSSecret: "egress-mtls-secret",
 							SSLName:   "foo.com",
 						},
 					},
 				},
 			},
-			jwtKeys: nil,
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/egress-mtls-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeCA,
+						},
+					},
+				},
+			},
 			context: "route",
-			egressMTLSSecrets: map[string]string{
-				"default/egress-trusted-secret": "/etc/nginx/secrets/default-egress-trusted-secret",
+			expected: policiesCfg{
+				ErrorReturn: &version2.Return{
+					Code: 500,
+				},
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`EgressMTLS policy default/egress-mtls-policy references a secret default/egress-mtls-secret of a wrong type 'nginx.org/ca', must be 'kubernetes.io/tls'`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "egress mtls referencing wrong secret type",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "egress-mtls-policy",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/egress-mtls-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "egress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						EgressMTLS: &conf_v1.EgressMTLS{
+							TrustedCertSecret: "egress-trusted-secret",
+							SSLName:           "foo.com",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/egress-trusted-secret": {
+						Secret: &api_v1.Secret{
+							Type: api_v1.SecretTypeTLS,
+						},
+					},
+				},
+			},
+			context: "route",
+			expected: policiesCfg{
+				ErrorReturn: &version2.Return{
+					Code: 500,
+				},
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`EgressMTLS policy default/egress-mtls-policy references a secret default/egress-trusted-secret of a wrong type 'kubernetes.io/tls', must be 'nginx.org/ca'`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "egress trusted secret referencing wrong secret type",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "egress-mtls-policy",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/egress-mtls-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "egress-mtls-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						EgressMTLS: &conf_v1.EgressMTLS{
+							TLSSecret: "egress-mtls-secret",
+							SSLName:   "foo.com",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/egress-mtls-secret": {
+						Secret: &api_v1.Secret{
+							Type: api_v1.SecretTypeTLS,
+						},
+						Error: errors.New("secret is invalid"),
+					},
+				},
+			},
+			context: "route",
+			expected: policiesCfg{
+				ErrorReturn: &version2.Return{
+					Code: 500,
+				},
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`EgressMTLS policy default/egress-mtls-policy references an invalid secret default/egress-mtls-secret: secret is invalid`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "egress mtls referencing missing tls secret",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "oidc-policy",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/oidc-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "oidc-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						OIDC: &conf_v1.OIDC{
+							ClientSecret: "oidc-secret",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/oidc-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeOIDC,
+						},
+						Error: errors.New("secret is invalid"),
+					},
+				},
+			},
+			context: "route",
+			expected: policiesCfg{
+				ErrorReturn: &version2.Return{
+					Code: 500,
+				},
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`OIDC policy default/oidc-policy references an invalid secret default/oidc-secret: secret is invalid`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "oidc referencing missing oidc secret",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "oidc-policy",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/oidc-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "oidc-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						OIDC: &conf_v1.OIDC{
+							ClientSecret:  "oidc-secret",
+							AuthEndpoint:  "http://foo.com/bar",
+							TokenEndpoint: "http://foo.com/bar",
+							JWKSURI:       "http://foo.com/bar",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/oidc-secret": {
+						Secret: &api_v1.Secret{
+							Type: api_v1.SecretTypeTLS,
+						},
+					},
+				},
+			},
+			context: "spec",
+			expected: policiesCfg{
+				ErrorReturn: &version2.Return{
+					Code: 500,
+				},
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`OIDC policy default/oidc-policy references a secret default/oidc-secret of a wrong type 'kubernetes.io/tls', must be 'nginx.org/oidc'`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "oidc secret referencing wrong secret type",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "oidc-policy-2",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/oidc-policy-1": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "oidc-policy-1",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						OIDC: &conf_v1.OIDC{
+							ClientID:      "foo",
+							ClientSecret:  "oidc-secret",
+							AuthEndpoint:  "https://foo.com/auth",
+							TokenEndpoint: "https://foo.com/token",
+							JWKSURI:       "https://foo.com/certs",
+						},
+					},
+				},
+				"default/oidc-policy-2": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "oidc-policy-2",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						OIDC: &conf_v1.OIDC{
+							ClientID:      "foo",
+							ClientSecret:  "oidc-secret",
+							AuthEndpoint:  "https://bar.com/auth",
+							TokenEndpoint: "https://bar.com/token",
+							JWKSURI:       "https://bar.com/certs",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/oidc-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeOIDC,
+							Data: map[string][]byte{
+								"client-secret": []byte("super_secret_123"),
+							},
+						},
+					},
+				},
+			},
+			context: "route",
+			oidcPolCfg: &oidcPolicyCfg{
+				oidc: &version2.OIDC{
+					AuthEndpoint:  "https://foo.com/auth",
+					TokenEndpoint: "https://foo.com/token",
+					JwksURI:       "https://foo.com/certs",
+					ClientID:      "foo",
+					ClientSecret:  "super_secret_123",
+					RedirectURI:   "/_codexch",
+					Scope:         "openid",
+				},
+				key: "default/oidc-policy-1",
 			},
 			expected: policiesCfg{
 				ErrorReturn: &version2.Return{
 					Code: 500,
 				},
 			},
-			expectedWarnings: map[runtime.Object][]string{
+			expectedWarnings: Warnings{
 				nil: {
-					`EgressMTLS policy "default/egress-mtls-policy" references a Secret which does not exist`,
+					`Only one oidc policy is allowed in a VirtualServer and its VirtualServerRoutes. Can't use default/oidc-policy-2. Use default/oidc-policy-1`,
 				},
 			},
-			msg: "egress mtls referencing missing tls secret",
+			expectedOidc: &oidcPolicyCfg{
+				oidc: &version2.OIDC{
+					AuthEndpoint:  "https://foo.com/auth",
+					TokenEndpoint: "https://foo.com/token",
+					JwksURI:       "https://foo.com/certs",
+					ClientID:      "foo",
+					ClientSecret:  "super_secret_123",
+					RedirectURI:   "/_codexch",
+					Scope:         "openid",
+				},
+				key: "default/oidc-policy-1",
+			},
+			msg: "multiple oidc policies",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "oidc-policy",
+					Namespace: "default",
+				},
+				{
+					Name:      "oidc-policy2",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/oidc-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "oidc-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						OIDC: &conf_v1.OIDC{
+							ClientSecret:  "oidc-secret",
+							AuthEndpoint:  "https://foo.com/auth",
+							TokenEndpoint: "https://foo.com/token",
+							JWKSURI:       "https://foo.com/certs",
+							ClientID:      "foo",
+						},
+					},
+				},
+				"default/oidc-policy2": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "oidc-policy2",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						OIDC: &conf_v1.OIDC{
+							ClientSecret:  "oidc-secret",
+							AuthEndpoint:  "https://bar.com/auth",
+							TokenEndpoint: "https://bar.com/token",
+							JWKSURI:       "https://bar.com/certs",
+							ClientID:      "bar",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				secretRefs: map[string]*secrets.SecretReference{
+					"default/oidc-secret": {
+						Secret: &api_v1.Secret{
+							Type: secrets.SecretTypeOIDC,
+							Data: map[string][]byte{
+								"client-secret": []byte("super_secret_123"),
+							},
+						},
+					},
+				},
+			},
+			context: "route",
+			expected: policiesCfg{
+				OIDC: true,
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`Multiple oidc policies in the same context is not valid. OIDC policy default/oidc-policy2 will be ignored`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{
+				&version2.OIDC{
+					AuthEndpoint:  "https://foo.com/auth",
+					TokenEndpoint: "https://foo.com/token",
+					JwksURI:       "https://foo.com/certs",
+					ClientID:      "foo",
+					ClientSecret:  "super_secret_123",
+					RedirectURI:   "/_codexch",
+					Scope:         "openid",
+				},
+				"default/oidc-policy",
+			},
+			msg: "multi oidc",
+		},
+		{
+			policyRefs: []conf_v1.PolicyReference{
+				{
+					Name:      "waf-policy",
+					Namespace: "default",
+				},
+				{
+					Name:      "waf-policy2",
+					Namespace: "default",
+				},
+			},
+			policies: map[string]*conf_v1.Policy{
+				"default/waf-policy": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "waf-policy",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						WAF: &conf_v1.WAF{
+							Enable:   true,
+							ApPolicy: "default/dataguard-alarm",
+						},
+					},
+				},
+				"default/waf-policy2": {
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      "waf-policy2",
+						Namespace: "default",
+					},
+					Spec: conf_v1.PolicySpec{
+						WAF: &conf_v1.WAF{
+							Enable:   true,
+							ApPolicy: "default/dataguard-alarm",
+						},
+					},
+				},
+			},
+			policyOpts: policyOptions{
+				apResources: map[string]string{
+					"default/logconf":         "/etc/nginx/waf/nac-logconfs/default-logconf",
+					"default/dataguard-alarm": "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+				},
+			},
+			context: "route",
+			expected: policiesCfg{
+				WAF: &version2.WAF{
+					Enable:   "on",
+					ApPolicy: "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+				},
+			},
+			expectedWarnings: Warnings{
+				nil: {
+					`Multiple WAF policies in the same context is not valid. WAF policy default/waf-policy2 will be ignored`,
+				},
+			},
+			expectedOidc: &oidcPolicyCfg{},
+			msg:          "multi waf",
 		},
 	}
 
 	for _, test := range tests {
 		vsc := newVirtualServerConfigurator(&ConfigParams{}, false, false, &StaticConfigParams{})
 
-		result := vsc.generatePolicies(owner, ownerNamespace, vsNamespace, vsName, test.policyRefs, test.policies, test.jwtKeys, test.ingressMTLSFileName, test.context, test.tlsPemFileName, test.egressMTLSSecrets)
+		if test.oidcPolCfg != nil {
+			vsc.oidcPolCfg = test.oidcPolCfg
+		}
+
+		result := vsc.generatePolicies(ownerDetails, test.policyRefs, test.policies, test.context, test.policyOpts)
 		if diff := cmp.Diff(test.expected, result); diff != "" {
 			t.Errorf("generatePolicies() '%v' mismatch (-want +got):\n%s", test.msg, diff)
 		}
 		if !reflect.DeepEqual(vsc.warnings, test.expectedWarnings) {
-			t.Errorf("generatePolicies() returned warnings of \n%v but expected \n%v for the case of %s", vsc.warnings, test.expectedWarnings, test.msg)
+			t.Errorf(
+				"generatePolicies() returned warnings of \n%v but expected \n%v for the case of %s",
+				vsc.warnings,
+				test.expectedWarnings,
+				test.msg,
+			)
+		}
+		if diff := cmp.Diff(test.expectedOidc.oidc, vsc.oidcPolCfg.oidc); diff != "" {
+			t.Errorf("generatePolicies() '%v' mismatch (-want +got):\n%s", test.msg, diff)
+		}
+		if diff := cmp.Diff(test.expectedOidc.key, vsc.oidcPolCfg.key); diff != "" {
+			t.Errorf("generatePolicies() '%v' mismatch (-want +got):\n%s", test.msg, diff)
 		}
 	}
 }
@@ -2904,7 +3698,7 @@ func TestGenerateSnippets(t *testing.T) {
 		{
 			true,
 			"test",
-			[]string{""},
+			[]string{},
 			[]string{"test"},
 		},
 		{
@@ -2916,7 +3710,7 @@ func TestGenerateSnippets(t *testing.T) {
 		{
 			true,
 			"test\none\ntwo",
-			[]string{""},
+			[]string{},
 			[]string{"test", "one", "two"},
 		},
 		{
@@ -2989,11 +3783,16 @@ func TestGenerateLocationForProxying(t *testing.T) {
 		ProxyNextUpstreamTimeout: "0s",
 		ProxyNextUpstreamTries:   0,
 		ProxyPassRequestHeaders:  true,
+		ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+		ServiceName:              "",
+		IsVSR:                    false,
+		VSRName:                  "",
+		VSRNamespace:             "",
 	}
 
-	result := generateLocationForProxying(path, upstreamName, conf_v1.Upstream{}, &cfgParams, nil, false, 0, "", nil, "", vsLocSnippets)
-	if !reflect.DeepEqual(result, expected) {
-		t.Errorf("generateLocationForProxying() returned \n%v but expected \n%v", result, expected)
+	result := generateLocationForProxying(path, upstreamName, conf_v1.Upstream{}, &cfgParams, nil, false, 0, "", nil, "", vsLocSnippets, false, "", "")
+	if diff := cmp.Diff(expected, result); diff != "" {
+		t.Errorf("generateLocationForProxying() mismatch (-want +got):\n%s", diff)
 	}
 }
 
@@ -3030,7 +3829,6 @@ func TestGenerateReturnBlock(t *testing.T) {
 			t.Errorf("generateReturnBlock() returned %v but expected %v", result, test.expected)
 		}
 	}
-
 }
 
 func TestGenerateLocationForReturn(t *testing.T) {
@@ -3176,62 +3974,107 @@ func TestGenerateLocationForRedirect(t *testing.T) {
 
 func TestGenerateSSLConfig(t *testing.T) {
 	tests := []struct {
-		inputTLS            *conf_v1.TLS
-		inputTLSPemFileName string
-		inputCfgParams      *ConfigParams
-		expected            *version2.SSL
-		msg                 string
+		inputTLS         *conf_v1.TLS
+		inputSecretRefs  map[string]*secrets.SecretReference
+		inputCfgParams   *ConfigParams
+		expectedSSL      *version2.SSL
+		expectedWarnings Warnings
+		msg              string
 	}{
 		{
-			inputTLS:            nil,
-			inputTLSPemFileName: "",
-			inputCfgParams:      &ConfigParams{},
-			expected:            nil,
-			msg:                 "no TLS field",
+			inputTLS:         nil,
+			inputSecretRefs:  map[string]*secrets.SecretReference{},
+			inputCfgParams:   &ConfigParams{},
+			expectedSSL:      nil,
+			expectedWarnings: Warnings{},
+			msg:              "no TLS field",
 		},
 		{
 			inputTLS: &conf_v1.TLS{
 				Secret: "",
 			},
-			inputTLSPemFileName: "",
-			inputCfgParams:      &ConfigParams{},
-			expected:            nil,
-			msg:                 "TLS field with empty secret",
+			inputSecretRefs:  map[string]*secrets.SecretReference{},
+			inputCfgParams:   &ConfigParams{},
+			expectedSSL:      nil,
+			expectedWarnings: Warnings{},
+			msg:              "TLS field with empty secret",
 		},
 		{
 			inputTLS: &conf_v1.TLS{
 				Secret: "secret",
 			},
-			inputTLSPemFileName: "",
-			inputCfgParams:      &ConfigParams{},
-			expected: &version2.SSL{
-				HTTP2:          false,
-				Certificate:    pemFileNameForMissingTLSSecret,
-				CertificateKey: pemFileNameForMissingTLSSecret,
-				Ciphers:        "NULL",
+			inputCfgParams: &ConfigParams{},
+			inputSecretRefs: map[string]*secrets.SecretReference{
+				"default/secret": {
+					Error: errors.New("secret doesn't exist"),
+				},
 			},
-			msg: "secret doesn't exist in the cluster with HTTP2",
+			expectedSSL: &version2.SSL{
+				HTTP2:           false,
+				RejectHandshake: true,
+			},
+			expectedWarnings: Warnings{
+				nil: []string{"TLS secret secret is invalid: secret doesn't exist"},
+			},
+			msg: "secret doesn't exist in the cluster with HTTPS",
 		},
 		{
 			inputTLS: &conf_v1.TLS{
 				Secret: "secret",
 			},
-			inputTLSPemFileName: "secret.pem",
-			inputCfgParams:      &ConfigParams{},
-			expected: &version2.SSL{
-				HTTP2:          false,
-				Certificate:    "secret.pem",
-				CertificateKey: "secret.pem",
-				Ciphers:        "",
+			inputCfgParams: &ConfigParams{},
+			inputSecretRefs: map[string]*secrets.SecretReference{
+				"default/secret": {
+					Secret: &api_v1.Secret{
+						Type: secrets.SecretTypeCA,
+					},
+				},
 			},
-			msg: "normal case with HTTP2",
+			expectedSSL: &version2.SSL{
+				HTTP2:           false,
+				RejectHandshake: true,
+			},
+			expectedWarnings: Warnings{
+				nil: []string{"TLS secret secret is of a wrong type 'nginx.org/ca', must be 'kubernetes.io/tls'"},
+			},
+			msg: "wrong secret type",
+		},
+		{
+			inputTLS: &conf_v1.TLS{
+				Secret: "secret",
+			},
+			inputSecretRefs: map[string]*secrets.SecretReference{
+				"default/secret": {
+					Secret: &api_v1.Secret{
+						Type: api_v1.SecretTypeTLS,
+					},
+					Path: "secret.pem",
+				},
+			},
+			inputCfgParams: &ConfigParams{},
+			expectedSSL: &version2.SSL{
+				HTTP2:           false,
+				Certificate:     "secret.pem",
+				CertificateKey:  "secret.pem",
+				RejectHandshake: false,
+			},
+			expectedWarnings: Warnings{},
+			msg:              "normal case with HTTPS",
 		},
 	}
 
+	namespace := "default"
+
 	for _, test := range tests {
-		result := generateSSLConfig(test.inputTLS, test.inputTLSPemFileName, test.inputCfgParams)
-		if !reflect.DeepEqual(result, test.expected) {
-			t.Errorf("generateSSLConfig() returned %v but expected %v for the case of %s", result, test.expected, test.msg)
+		vsc := newVirtualServerConfigurator(&ConfigParams{}, false, false, &StaticConfigParams{})
+
+		// it is ok to use nil as the owner
+		result := vsc.generateSSLConfig(nil, test.inputTLS, namespace, test.inputSecretRefs, test.inputCfgParams)
+		if !reflect.DeepEqual(result, test.expectedSSL) {
+			t.Errorf("generateSSLConfig() returned %v but expected %v for the case of %s", result, test.expectedSSL, test.msg)
+		}
+		if !reflect.DeepEqual(vsc.warnings, test.expectedWarnings) {
+			t.Errorf("generateSSLConfig() returned warnings of \n%v but expected \n%v for the case of %s", vsc.warnings, test.expectedWarnings, test.msg)
 		}
 	}
 }
@@ -3648,9 +4491,12 @@ func TestGenerateSplits(t *testing.T) {
 	}
 	expectedLocations := []version2.Location{
 		{
-			Path:                     "/internal_location_splits_1_split_0",
-			ProxyPass:                "http://vs_default_cafe_coffee-v1",
-			Rewrites:                 []string{"^ $request_uri", fmt.Sprintf(`"^%v(.*)$" "/rewrite$1" break`, originalPath)},
+			Path:      "/internal_location_splits_1_split_0",
+			ProxyPass: "http://vs_default_cafe_coffee-v1",
+			Rewrites: []string{
+				"^ $request_uri",
+				fmt.Sprintf(`"^%v(.*)$" "/rewrite$1" break`, originalPath),
+			},
 			ProxyNextUpstream:        "error timeout",
 			ProxyNextUpstreamTimeout: "0s",
 			ProxyNextUpstreamTries:   0,
@@ -3670,7 +4516,12 @@ func TestGenerateSplits(t *testing.T) {
 			},
 			ProxySSLName:            "coffee-v1.default.svc",
 			ProxyPassRequestHeaders: true,
+			ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
 			Snippets:                []string{locSnippet},
+			ServiceName:             "coffee-v1",
+			IsVSR:                   true,
+			VSRName:                 "coffee",
+			VSRNamespace:            "default",
 		},
 		{
 			Path:                     "/internal_location_splits_1_split_1",
@@ -3694,7 +4545,12 @@ func TestGenerateSplits(t *testing.T) {
 			},
 			ProxySSLName:            "coffee-v2.default.svc",
 			ProxyPassRequestHeaders: true,
+			ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
 			Snippets:                []string{locSnippet},
+			ServiceName:             "coffee-v2",
+			IsVSR:                   true,
+			VSRName:                 "coffee",
+			VSRNamespace:            "default",
 		},
 		{
 			Path:                 "/internal_location_splits_1_split_2",
@@ -3721,8 +4577,23 @@ func TestGenerateSplits(t *testing.T) {
 	}
 	returnLocationIndex := 1
 
-	resultSplitClient, resultLocations, resultReturnLocations := generateSplits(splits, upstreamNamer, crUpstreams,
-		variableNamer, scIndex, &cfgParams, errorPages, 0, originalPath, locSnippet, enableSnippets, returnLocationIndex)
+	resultSplitClient, resultLocations, resultReturnLocations := generateSplits(
+		splits,
+		upstreamNamer,
+		crUpstreams,
+		variableNamer,
+		scIndex,
+		&cfgParams,
+		errorPages,
+		0,
+		originalPath,
+		locSnippet,
+		enableSnippets,
+		returnLocationIndex,
+		true,
+		"coffee",
+		"default",
+	)
 	if !reflect.DeepEqual(resultSplitClient, expectedSplitClient) {
 		t.Errorf("generateSplits() returned \n%+v but expected \n%+v", resultSplitClient, expectedSplitClient)
 	}
@@ -3732,7 +4603,6 @@ func TestGenerateSplits(t *testing.T) {
 	if !reflect.DeepEqual(resultReturnLocations, expectedReturnLocations) {
 		t.Errorf("generateSplits() returned \n%+v but expected \n%+v", resultReturnLocations, expectedReturnLocations)
 	}
-
 }
 
 func TestGenerateDefaultSplitsConfig(t *testing.T) {
@@ -3790,6 +4660,11 @@ func TestGenerateDefaultSplitsConfig(t *testing.T) {
 				Internal:                 true,
 				ProxySSLName:             "coffee-v1.default.svc",
 				ProxyPassRequestHeaders:  true,
+				ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:              "coffee-v1",
+				IsVSR:                    true,
+				VSRName:                  "coffee",
+				VSRNamespace:             "default",
 			},
 			{
 				Path:                     "/internal_location_splits_1_split_1",
@@ -3800,6 +4675,11 @@ func TestGenerateDefaultSplitsConfig(t *testing.T) {
 				Internal:                 true,
 				ProxySSLName:             "coffee-v2.default.svc",
 				ProxyPassRequestHeaders:  true,
+				ProxySetHeaders:          []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:              "coffee-v2",
+				IsVSR:                    true,
+				VSRName:                  "coffee",
+				VSRNamespace:             "default",
 			},
 		},
 		InternalRedirectLocation: version2.InternalRedirectLocation{
@@ -3821,7 +4701,7 @@ func TestGenerateDefaultSplitsConfig(t *testing.T) {
 	}
 
 	result := generateDefaultSplitsConfig(route, upstreamNamer, crUpstreams, variableNamer, index, &cfgParams,
-		route.ErrorPages, 0, "", locSnippet, enableSnippets, 0)
+		route.ErrorPages, 0, "", locSnippet, enableSnippets, 0, true, "coffee", "default")
 	if !reflect.DeepEqual(result, expected) {
 		t.Errorf("generateDefaultSplitsConfig() returned \n%+v but expected \n%+v", result, expected)
 	}
@@ -4089,6 +4969,11 @@ func TestGenerateMatchesConfig(t *testing.T) {
 				},
 				ProxySSLName:            "coffee-v1.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v1",
+				IsVSR:                   false,
+				VSRName:                 "",
+				VSRNamespace:            "",
 			},
 			{
 				Path:                     "/internal_location_splits_2_split_0",
@@ -4112,6 +4997,11 @@ func TestGenerateMatchesConfig(t *testing.T) {
 				},
 				ProxySSLName:            "coffee-v1.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v1",
+				IsVSR:                   false,
+				VSRName:                 "",
+				VSRNamespace:            "",
 			},
 			{
 				Path:                     "/internal_location_splits_2_split_1",
@@ -4135,6 +5025,11 @@ func TestGenerateMatchesConfig(t *testing.T) {
 				},
 				ProxySSLName:            "coffee-v2.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v2",
+				IsVSR:                   false,
+				VSRName:                 "",
+				VSRNamespace:            "",
 			},
 			{
 				Path:                     "/internal_location_matches_1_default",
@@ -4158,6 +5053,11 @@ func TestGenerateMatchesConfig(t *testing.T) {
 				},
 				ProxySSLName:            "tea.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "tea",
+				IsVSR:                   false,
+				VSRName:                 "",
+				VSRNamespace:            "",
 			},
 		},
 		InternalRedirectLocation: version2.InternalRedirectLocation{
@@ -4191,7 +5091,23 @@ func TestGenerateMatchesConfig(t *testing.T) {
 		"vs_default_cafe_tea":       {Service: "tea"},
 	}
 
-	result := generateMatchesConfig(route, upstreamNamer, crUpstreams, variableNamer, index, scIndex, &cfgParams, errorPages, 2, locSnippets, enableSnippets, 0)
+	result := generateMatchesConfig(
+		route,
+		upstreamNamer,
+		crUpstreams,
+		variableNamer,
+		index,
+		scIndex,
+		&cfgParams,
+		errorPages,
+		2,
+		locSnippets,
+		enableSnippets,
+		0,
+		false,
+		"",
+		"",
+	)
 	if !reflect.DeepEqual(result, expected) {
 		t.Errorf("generateMatchesConfig() returned \n%+v but expected \n%+v", result, expected)
 	}
@@ -4373,6 +5289,11 @@ func TestGenerateMatchesConfigWithMultipleSplits(t *testing.T) {
 				ProxyInterceptErrors:    true,
 				ProxySSLName:            "coffee-v1.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v1",
+				IsVSR:                   true,
+				VSRName:                 "coffee",
+				VSRNamespace:            "default",
 			},
 			{
 				Path:                     "/internal_location_splits_2_split_1",
@@ -4396,6 +5317,11 @@ func TestGenerateMatchesConfigWithMultipleSplits(t *testing.T) {
 				ProxyInterceptErrors:    true,
 				ProxySSLName:            "coffee-v2.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v2",
+				IsVSR:                   true,
+				VSRName:                 "coffee",
+				VSRNamespace:            "default",
 			},
 			{
 				Path:                     "/internal_location_splits_3_split_0",
@@ -4419,6 +5345,11 @@ func TestGenerateMatchesConfigWithMultipleSplits(t *testing.T) {
 				ProxyInterceptErrors:    true,
 				ProxySSLName:            "coffee-v2.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v2",
+				IsVSR:                   true,
+				VSRName:                 "coffee",
+				VSRNamespace:            "default",
 			},
 			{
 				Path:                     "/internal_location_splits_3_split_1",
@@ -4442,6 +5373,11 @@ func TestGenerateMatchesConfigWithMultipleSplits(t *testing.T) {
 				ProxyInterceptErrors:    true,
 				ProxySSLName:            "coffee-v1.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v1",
+				IsVSR:                   true,
+				VSRName:                 "coffee",
+				VSRNamespace:            "default",
 			},
 			{
 				Path:                     "/internal_location_splits_4_split_0",
@@ -4465,6 +5401,11 @@ func TestGenerateMatchesConfigWithMultipleSplits(t *testing.T) {
 				ProxyInterceptErrors:    true,
 				ProxySSLName:            "coffee-v1.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v1",
+				IsVSR:                   true,
+				VSRName:                 "coffee",
+				VSRNamespace:            "default",
 			},
 			{
 				Path:                     "/internal_location_splits_4_split_1",
@@ -4488,6 +5429,11 @@ func TestGenerateMatchesConfigWithMultipleSplits(t *testing.T) {
 				ProxyInterceptErrors:    true,
 				ProxySSLName:            "coffee-v2.default.svc",
 				ProxyPassRequestHeaders: true,
+				ProxySetHeaders:         []version2.Header{{Name: "Host", Value: "$host"}},
+				ServiceName:             "coffee-v2",
+				IsVSR:                   true,
+				VSRName:                 "coffee",
+				VSRNamespace:            "default",
 			},
 		},
 		InternalRedirectLocation: version2.InternalRedirectLocation{
@@ -4547,7 +5493,23 @@ func TestGenerateMatchesConfigWithMultipleSplits(t *testing.T) {
 		"vs_default_cafe_coffee-v1": {Service: "coffee-v1"},
 		"vs_default_cafe_coffee-v2": {Service: "coffee-v2"},
 	}
-	result := generateMatchesConfig(route, upstreamNamer, crUpstreams, variableNamer, index, scIndex, &cfgParams, errorPages, 0, locSnippets, enableSnippets, 0)
+	result := generateMatchesConfig(
+		route,
+		upstreamNamer,
+		crUpstreams,
+		variableNamer,
+		index,
+		scIndex,
+		&cfgParams,
+		errorPages,
+		0,
+		locSnippets,
+		enableSnippets,
+		0,
+		true,
+		"coffee",
+		"default",
+	)
 	if !reflect.DeepEqual(result, expected) {
 		t.Errorf("generateMatchesConfig() returned \n%+v but expected \n%+v", result, expected)
 	}
@@ -4903,6 +5865,33 @@ func TestGenerateHealthCheck(t *testing.T) {
 			expected:     nil,
 			msg:          "HealthCheck not enabled",
 		},
+		{
+			upstream: conf_v1.Upstream{
+				HealthCheck: &conf_v1.HealthCheck{
+					Enable:         true,
+					Interval:       "1m 5s",
+					Jitter:         "2m 3s",
+					ConnectTimeout: "1m 10s",
+					SendTimeout:    "1m 20s",
+					ReadTimeout:    "1m 30s",
+				},
+			},
+			upstreamName: upstreamName,
+			expected: &version2.HealthCheck{
+				Name:                upstreamName,
+				ProxyConnectTimeout: "1m10s",
+				ProxySendTimeout:    "1m20s",
+				ProxyReadTimeout:    "1m30s",
+				ProxyPass:           fmt.Sprintf("http://%v", upstreamName),
+				URI:                 "/",
+				Interval:            "1m5s",
+				Jitter:              "2m3s",
+				Fails:               1,
+				Passes:              1,
+				Headers:             make(map[string]string),
+			},
+			msg: "HealthCheck with time parameters have correct format",
+		},
 	}
 
 	baseCfgParams := &ConfigParams{
@@ -5087,7 +6076,12 @@ func TestGenerateEndpointsForUpstream(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		vsc := newVirtualServerConfigurator(&ConfigParams{}, test.isPlus, test.isResolverConfigured, &StaticConfigParams{})
+		vsc := newVirtualServerConfigurator(
+			&ConfigParams{},
+			test.isPlus,
+			test.isResolverConfigured,
+			&StaticConfigParams{},
+		)
 		result := vsc.generateEndpointsForUpstream(test.vsEx.VirtualServer, namespace, test.upstream, test.vsEx)
 		if !reflect.DeepEqual(result, test.expected) {
 			t.Errorf("generateEndpointsForUpstream(isPlus=%v, isResolverConfigured=%v) returned %v, but expected %v for case: %v",
@@ -5095,8 +6089,12 @@ func TestGenerateEndpointsForUpstream(t *testing.T) {
 		}
 
 		if len(vsc.warnings) == 0 && test.warningsExpected {
-			t.Errorf("generateEndpointsForUpstream(isPlus=%v, isResolverConfigured=%v) didn't return any warnings for %v but warnings expected",
-				test.isPlus, test.isResolverConfigured, test.upstream)
+			t.Errorf(
+				"generateEndpointsForUpstream(isPlus=%v, isResolverConfigured=%v) didn't return any warnings for %v but warnings expected",
+				test.isPlus,
+				test.isResolverConfigured,
+				test.upstream,
+			)
 		}
 
 		if len(vsc.warnings) != 0 && !test.warningsExpected {
@@ -5111,7 +6109,7 @@ func TestGenerateSlowStartForPlusWithInCompatibleLBMethods(t *testing.T) {
 	upstream := conf_v1.Upstream{Service: serviceName, Port: 80, SlowStart: "10s"}
 	expected := ""
 
-	var tests = []string{
+	tests := []string{
 		"random",
 		"ip_hash",
 		"hash 123",
@@ -5133,7 +6131,6 @@ func TestGenerateSlowStartForPlusWithInCompatibleLBMethods(t *testing.T) {
 			t.Errorf("generateSlowStartForPlus returned no warnings for %v but warnings expected", upstream)
 		}
 	}
-
 }
 
 func TestGenerateSlowStartForPlus(t *testing.T) {
@@ -5222,9 +6219,13 @@ func TestGenerateUpstreamWithQueue(t *testing.T) {
 			msg: "upstream queue with size and timeout",
 		},
 		{
-			name:     "test-upstream-queue-with-default-timeout",
-			upstream: conf_v1.Upstream{Service: serviceName, Port: 80, Queue: &conf_v1.UpstreamQueue{Size: 10, Timeout: ""}},
-			isPlus:   true,
+			name: "test-upstream-queue-with-default-timeout",
+			upstream: conf_v1.Upstream{
+				Service: serviceName,
+				Port:    80,
+				Queue:   &conf_v1.UpstreamQueue{Size: 10, Timeout: ""},
+			},
+			isPlus: true,
 			expected: version2.Upstream{
 				UpstreamLabels: version2.UpstreamLabels{
 					Service: "test-queue",
@@ -5258,7 +6259,6 @@ func TestGenerateUpstreamWithQueue(t *testing.T) {
 			t.Errorf("generateUpstream() returned %v but expected %v for the case of %v", result, test.expected, test.msg)
 		}
 	}
-
 }
 
 func TestGenerateQueueForPlus(t *testing.T) {
@@ -5290,7 +6290,6 @@ func TestGenerateQueueForPlus(t *testing.T) {
 			t.Errorf("generateQueueForPlus() returned %v but expected %v for the case of %v", result, test.expected, test.msg)
 		}
 	}
-
 }
 
 func TestGenerateSessionCookie(t *testing.T) {
@@ -5597,7 +6596,6 @@ func TestIsTLSEnabled(t *testing.T) {
 			t.Errorf("isTLSEnabled(%v, %v) returned %v but expected %v", test.upstream, test.spiffeCert, result, test.expected)
 		}
 	}
-
 }
 
 func TestGenerateRewrites(t *testing.T) {
@@ -5715,14 +6713,17 @@ func TestGenerateProxySetHeaders(t *testing.T) {
 	tests := []struct {
 		proxy    *conf_v1.ActionProxy
 		expected []version2.Header
+		msg      string
 	}{
 		{
 			proxy:    nil,
-			expected: nil,
+			expected: []version2.Header{{Name: "Host", Value: "$host"}},
+			msg:      "no action proxy",
 		},
 		{
 			proxy:    &conf_v1.ActionProxy{},
-			expected: nil,
+			expected: []version2.Header{{Name: "Host", Value: "$host"}},
+			msg:      "empty action proxy",
 		},
 		{
 			proxy: &conf_v1.ActionProxy{
@@ -5731,10 +6732,6 @@ func TestGenerateProxySetHeaders(t *testing.T) {
 						{
 							Name:  "Header-Name",
 							Value: "HeaderValue",
-						},
-						{
-							Name:  "Host",
-							Value: "nginx.org",
 						},
 					},
 				},
@@ -5746,16 +6743,106 @@ func TestGenerateProxySetHeaders(t *testing.T) {
 				},
 				{
 					Name:  "Host",
-					Value: "nginx.org",
+					Value: "$host",
 				},
 			},
+			msg: "set headers without host",
+		},
+		{
+			proxy: &conf_v1.ActionProxy{
+				RequestHeaders: &conf_v1.ProxyRequestHeaders{
+					Set: []conf_v1.Header{
+						{
+							Name:  "Header-Name",
+							Value: "HeaderValue",
+						},
+						{
+							Name:  "Host",
+							Value: "example.com",
+						},
+					},
+				},
+			},
+			expected: []version2.Header{
+				{
+					Name:  "Header-Name",
+					Value: "HeaderValue",
+				},
+				{
+					Name:  "Host",
+					Value: "example.com",
+				},
+			},
+			msg: "set headers with host capitalized",
+		},
+		{
+			proxy: &conf_v1.ActionProxy{
+				RequestHeaders: &conf_v1.ProxyRequestHeaders{
+					Set: []conf_v1.Header{
+						{
+							Name:  "Header-Name",
+							Value: "HeaderValue",
+						},
+						{
+							Name:  "hoST",
+							Value: "example.com",
+						},
+					},
+				},
+			},
+			expected: []version2.Header{
+				{
+					Name:  "Header-Name",
+					Value: "HeaderValue",
+				},
+				{
+					Name:  "hoST",
+					Value: "example.com",
+				},
+			},
+			msg: "set headers with host in mixed case",
+		},
+		{
+			proxy: &conf_v1.ActionProxy{
+				RequestHeaders: &conf_v1.ProxyRequestHeaders{
+					Set: []conf_v1.Header{
+						{
+							Name:  "Header-Name",
+							Value: "HeaderValue",
+						},
+						{
+							Name:  "Host",
+							Value: "one.example.com",
+						},
+						{
+							Name:  "Host",
+							Value: "two.example.com",
+						},
+					},
+				},
+			},
+			expected: []version2.Header{
+				{
+					Name:  "Header-Name",
+					Value: "HeaderValue",
+				},
+				{
+					Name:  "Host",
+					Value: "one.example.com",
+				},
+				{
+					Name:  "Host",
+					Value: "two.example.com",
+				},
+			},
+			msg: "set headers with multiple hosts",
 		},
 	}
 
 	for _, test := range tests {
 		result := generateProxySetHeaders(test.proxy)
-		if !reflect.DeepEqual(result, test.expected) {
-			t.Errorf("generateProxySetHeaders(%v) returned %v but expected %v", test.proxy, result, test.expected)
+		if diff := cmp.Diff(test.expected, result); diff != "" {
+			t.Errorf("generateProxySetHeaders() '%v' mismatch (-want +got):\n%s", test.msg, diff)
 		}
 	}
 }
@@ -5968,7 +7055,7 @@ func TestGenerateProxyAddHeaders(t *testing.T) {
 }
 
 func TestGetUpstreamResourceLabels(t *testing.T) {
-	var tests = []struct {
+	tests := []struct {
 		owner    runtime.Object
 		expected version2.UpstreamLabels
 	}{
@@ -6007,6 +7094,226 @@ func TestGetUpstreamResourceLabels(t *testing.T) {
 		result := getUpstreamResourceLabels(test.owner)
 		if !reflect.DeepEqual(result, test.expected) {
 			t.Errorf("getUpstreamResourceLabels(%+v) returned %+v but expected %+v", test.owner, result, test.expected)
+		}
+	}
+}
+
+func TestAddWafConfig(t *testing.T) {
+	tests := []struct {
+		wafInput     *conf_v1.WAF
+		polKey       string
+		polNamespace string
+		apResources  map[string]string
+		wafConfig    *version2.WAF
+		expected     *validationResults
+		msg          string
+	}{
+		{
+
+			wafInput: &conf_v1.WAF{
+				Enable: true,
+			},
+			polKey:       "default/waf-policy",
+			polNamespace: "default",
+			apResources:  map[string]string{},
+			wafConfig: &version2.WAF{
+				Enable: "on",
+			},
+			expected: &validationResults{isError: false},
+			msg:      "valid waf config, default App Protect config",
+		},
+		{
+
+			wafInput: &conf_v1.WAF{
+				Enable:   true,
+				ApPolicy: "dataguard-alarm",
+				SecurityLog: &conf_v1.SecurityLog{
+					Enable:    true,
+					ApLogConf: "logconf",
+					LogDest:   "syslog:server=127.0.0.1:514",
+				},
+			},
+			polKey:       "default/waf-policy",
+			polNamespace: "default",
+			apResources: map[string]string{
+				"default/dataguard-alarm": "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+				"default/logconf":         "/etc/nginx/waf/nac-logconfs/default-logconf",
+			},
+			wafConfig: &version2.WAF{
+				ApPolicy:            "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+				ApSecurityLogEnable: true,
+				ApLogConf:           "/etc/nginx/waf/nac-logconfs/default-logconf",
+			},
+			expected: &validationResults{isError: false},
+			msg:      "valid waf config",
+		},
+		{
+
+			wafInput: &conf_v1.WAF{
+				Enable:   true,
+				ApPolicy: "default/dataguard-alarm",
+				SecurityLog: &conf_v1.SecurityLog{
+					Enable:    true,
+					ApLogConf: "default/logconf",
+					LogDest:   "syslog:server=127.0.0.1:514",
+				},
+			},
+			polKey:       "default/waf-policy",
+			polNamespace: "",
+			apResources: map[string]string{
+				"default/dataguard-alarm": "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+			},
+			wafConfig: &version2.WAF{
+				ApPolicy:            "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+				ApSecurityLogEnable: true,
+				ApLogConf:           "/etc/nginx/waf/nac-logconfs/default-logconf",
+			},
+			expected: &validationResults{
+				isError: true,
+				warnings: []string{
+					`WAF policy default/waf-policy references an invalid or non-existing log config default/logconf`,
+				},
+			},
+			msg: "invalid waf config, apLogConf references non-existing log conf",
+		},
+		{
+
+			wafInput: &conf_v1.WAF{
+				Enable:   true,
+				ApPolicy: "default/dataguard-alarm",
+				SecurityLog: &conf_v1.SecurityLog{
+					Enable:  true,
+					LogDest: "syslog:server=127.0.0.1:514",
+				},
+			},
+			polKey:       "default/waf-policy",
+			polNamespace: "",
+			apResources: map[string]string{
+				"default/logconf": "/etc/nginx/waf/nac-logconfs/default-logconf",
+			},
+			wafConfig: &version2.WAF{
+				ApPolicy:            "/etc/nginx/waf/nac-policies/default-dataguard-alarm",
+				ApSecurityLogEnable: true,
+				ApLogConf:           "/etc/nginx/waf/nac-logconfs/default-logconf",
+			},
+			expected: &validationResults{
+				isError: true,
+				warnings: []string{
+					`WAF policy default/waf-policy references an invalid or non-existing App Protect policy default/dataguard-alarm`,
+				},
+			},
+			msg: "invalid waf config, apLogConf references non-existing ap conf",
+		},
+		{
+
+			wafInput: &conf_v1.WAF{
+				Enable:   true,
+				ApPolicy: "ns1/dataguard-alarm",
+				SecurityLog: &conf_v1.SecurityLog{
+					Enable:    true,
+					ApLogConf: "ns2/logconf",
+					LogDest:   "syslog:server=127.0.0.1:514",
+				},
+			},
+			polKey:       "default/waf-policy",
+			polNamespace: "",
+			apResources: map[string]string{
+				"ns1/dataguard-alarm": "/etc/nginx/waf/nac-policies/ns1-dataguard-alarm",
+				"ns2/logconf":         "/etc/nginx/waf/nac-logconfs/ns2-logconf",
+			},
+			wafConfig: &version2.WAF{
+				ApPolicy:            "/etc/nginx/waf/nac-policies/ns1-dataguard-alarm",
+				ApSecurityLogEnable: true,
+				ApLogConf:           "/etc/nginx/waf/nac-logconfs/ns2-logconf",
+			},
+			expected: &validationResults{},
+			msg:      "valid waf config, cross ns reference",
+		},
+		{
+
+			wafInput: &conf_v1.WAF{
+				Enable:   false,
+				ApPolicy: "dataguard-alarm",
+			},
+			polKey:       "default/waf-policy",
+			polNamespace: "default",
+			apResources: map[string]string{
+				"default/dataguard-alarm": "/etc/nginx/waf/nac-policies/ns1-dataguard-alarm",
+				"default/logconf":         "/etc/nginx/waf/nac-logconfs/ns2-logconf",
+			},
+			wafConfig: &version2.WAF{
+				Enable:   "off",
+				ApPolicy: "/etc/nginx/waf/nac-policies/ns1-dataguard-alarm",
+			},
+			expected: &validationResults{},
+			msg:      "valid waf config, disable waf",
+		},
+	}
+
+	for _, test := range tests {
+		polCfg := newPoliciesConfig()
+		result := polCfg.addWAFConfig(test.wafInput, test.polKey, test.polNamespace, test.apResources)
+		if diff := cmp.Diff(test.expected.warnings, result.warnings); diff != "" {
+			t.Errorf("policiesCfg.addWAFConfig() '%v' mismatch (-want +got):\n%s", test.msg, diff)
+		}
+	}
+}
+
+func TestGenerateTime(t *testing.T) {
+	tests := []struct {
+		value, expected string
+	}{
+		{
+			value:    "0s",
+			expected: "0s",
+		},
+		{
+			value:    "0",
+			expected: "0s",
+		},
+		{
+			value:    "1h",
+			expected: "1h",
+		},
+		{
+			value:    "1h 30m",
+			expected: "1h30m",
+		},
+	}
+
+	for _, test := range tests {
+		result := generateTime(test.value)
+		if result != test.expected {
+			t.Errorf("generateTime(%q) returned %q but expected %q", test.value, result, test.expected)
+		}
+	}
+}
+
+func TestGenerateTimeWithDefault(t *testing.T) {
+	tests := []struct {
+		value, defaultValue, expected string
+	}{
+		{
+			value:        "1h 30m",
+			defaultValue: "",
+			expected:     "1h30m",
+		},
+		{
+			value:        "",
+			defaultValue: "60s",
+			expected:     "60s",
+		},
+		{
+			value:        "",
+			defaultValue: "test",
+			expected:     "test",
+		},
+	}
+
+	for _, test := range tests {
+		result := generateTimeWithDefault(test.value, test.defaultValue)
+		if result != test.expected {
+			t.Errorf("generateTimeWithDefault(%q, %q) returned %q but expected %q", test.value, test.defaultValue, result, test.expected)
 		}
 	}
 }

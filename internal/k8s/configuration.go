@@ -9,6 +9,7 @@ import (
 
 	"github.com/nginxinc/kubernetes-ingress/internal/configs"
 	conf_v1 "github.com/nginxinc/kubernetes-ingress/pkg/apis/configuration/v1"
+	conf_v1alpha1 "github.com/nginxinc/kubernetes-ingress/pkg/apis/configuration/v1alpha1"
 	"github.com/nginxinc/kubernetes-ingress/pkg/apis/configuration/validation"
 	networking "k8s.io/api/networking/v1beta1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -16,9 +17,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const ingressKind = "Ingress"
-const virtualServerKind = "VirtualServer"
-const virtualServerRouteKind = "VirtualServerRoute"
+const (
+	ingressKind            = "Ingress"
+	virtualServerKind      = "VirtualServer"
+	virtualServerRouteKind = "VirtualServerRoute"
+	transportServerKind    = "TransportServer"
+)
 
 // Operation defines an operation to perform for a resource.
 type Operation int
@@ -34,11 +38,10 @@ const (
 // A Resource can be a top level configuration object:
 // - Regular or Master Ingress
 // - VirtualServer
+// - TransportServer
 type Resource interface {
 	GetObjectMeta() *metav1.ObjectMeta
 	GetKeyWithKind() string
-	AcquireHost(host string)
-	ReleaseHost(host string)
 	Wins(resource Resource) bool
 	AddWarning(warning string)
 	IsEqual(resource Resource) bool
@@ -81,14 +84,14 @@ func compareConfigurationProblems(problem1 *ConfigurationProblem, problem2 *Conf
 		problem1.Message == problem2.Message
 }
 
-// FullIngress holds an Ingress resource with its minions. It implements the Resource interface.
-type FullIngress struct {
+// IngressConfiguration holds an Ingress resource with its minions. It implements the Resource interface.
+type IngressConfiguration struct {
 	// Ingress holds a regular Ingress or a master Ingress.
 	Ingress *networking.Ingress
 	// IsMaster is true when the Ingress is a master.
 	IsMaster bool
 	// Minions contains minions if the Ingress is a master.
-	Minions []*FullMinion
+	Minions []*MinionConfiguration
 	// ValidHosts marks the hosts of the Ingress as valid (true) or invalid (false).
 	// Regular Ingress resources can have multiple hosts. It is possible that some of the hosts are taken by other
 	// resources. In that case, those hosts will be marked as invalid.
@@ -99,9 +102,9 @@ type FullIngress struct {
 	ChildWarnings map[string][]string
 }
 
-// NewRegularFullIngress creates a FullIngress from a regular Ingress resource.
-func NewRegularFullIngress(ing *networking.Ingress) *FullIngress {
-	return &FullIngress{
+// NewRegularIngressConfiguration creates an IngressConfiguration from an Ingress resource.
+func NewRegularIngressConfiguration(ing *networking.Ingress) *IngressConfiguration {
+	return &IngressConfiguration{
 		Ingress:       ing,
 		IsMaster:      false,
 		ValidHosts:    make(map[string]bool),
@@ -109,9 +112,9 @@ func NewRegularFullIngress(ing *networking.Ingress) *FullIngress {
 	}
 }
 
-// NewMasterFullIngress creates a FullIngress from a master Ingress resource.
-func NewMasterFullIngress(ing *networking.Ingress, minions []*FullMinion, childWarnings map[string][]string) *FullIngress {
-	return &FullIngress{
+// NewMasterIngressConfiguration creates an IngressConfiguration from a master Ingress resource.
+func NewMasterIngressConfiguration(ing *networking.Ingress, minions []*MinionConfiguration, childWarnings map[string][]string) *IngressConfiguration {
+	return &IngressConfiguration{
 		Ingress:       ing,
 		IsMaster:      true,
 		Minions:       minions,
@@ -121,61 +124,51 @@ func NewMasterFullIngress(ing *networking.Ingress, minions []*FullMinion, childW
 }
 
 // GetObjectMeta returns the resource ObjectMeta.
-func (fi *FullIngress) GetObjectMeta() *metav1.ObjectMeta {
-	return &fi.Ingress.ObjectMeta
+func (ic *IngressConfiguration) GetObjectMeta() *metav1.ObjectMeta {
+	return &ic.Ingress.ObjectMeta
 }
 
 // GetKeyWithKind returns the key of the resource with its kind. For example, Ingress/my-namespace/my-name.
-func (fi *FullIngress) GetKeyWithKind() string {
-	key := getResourceKey(&fi.Ingress.ObjectMeta)
+func (ic *IngressConfiguration) GetKeyWithKind() string {
+	key := getResourceKey(&ic.Ingress.ObjectMeta)
 	return fmt.Sprintf("%s/%s", ingressKind, key)
 }
 
-// AcquireHost acquires the host for this resource.
-func (fi *FullIngress) AcquireHost(host string) {
-	fi.ValidHosts[host] = true
-}
-
-// ReleaseHost releases the host.
-func (fi *FullIngress) ReleaseHost(host string) {
-	fi.ValidHosts[host] = false
-}
-
 // Wins tells if this resource wins over the specified resource.
-func (fi *FullIngress) Wins(resource Resource) bool {
-	return chooseObjectMetaWinner(fi.GetObjectMeta(), resource.GetObjectMeta())
+func (ic *IngressConfiguration) Wins(resource Resource) bool {
+	return chooseObjectMetaWinner(ic.GetObjectMeta(), resource.GetObjectMeta())
 }
 
 // AddWarning adds a warning.
-func (fi *FullIngress) AddWarning(warning string) {
-	fi.Warnings = append(fi.Warnings, warning)
+func (ic *IngressConfiguration) AddWarning(warning string) {
+	ic.Warnings = append(ic.Warnings, warning)
 }
 
-// IsEqual tests if the FullIngress is equal to the resource.
-func (fi *FullIngress) IsEqual(resource Resource) bool {
-	fullIngress, ok := resource.(*FullIngress)
+// IsEqual tests if the IngressConfiguration is equal to the resource.
+func (ic *IngressConfiguration) IsEqual(resource Resource) bool {
+	ingConfig, ok := resource.(*IngressConfiguration)
 	if !ok {
 		return false
 	}
 
-	if !compareObjectMetasWithAnnotations(&fi.Ingress.ObjectMeta, &fullIngress.Ingress.ObjectMeta) {
+	if !compareObjectMetasWithAnnotations(&ic.Ingress.ObjectMeta, &ingConfig.Ingress.ObjectMeta) {
 		return false
 	}
 
-	if !reflect.DeepEqual(fi.ValidHosts, fullIngress.ValidHosts) {
+	if !reflect.DeepEqual(ic.ValidHosts, ingConfig.ValidHosts) {
 		return false
 	}
 
-	if fi.IsMaster != fullIngress.IsMaster {
+	if ic.IsMaster != ingConfig.IsMaster {
 		return false
 	}
 
-	if len(fi.Minions) != len(fullIngress.Minions) {
+	if len(ic.Minions) != len(ingConfig.Minions) {
 		return false
 	}
 
-	for i := range fi.Minions {
-		if !compareObjectMetasWithAnnotations(&fi.Minions[i].Ingress.ObjectMeta, &fullIngress.Minions[i].Ingress.ObjectMeta) {
+	for i := range ic.Minions {
+		if !compareObjectMetasWithAnnotations(&ic.Minions[i].Ingress.ObjectMeta, &ingConfig.Minions[i].Ingress.ObjectMeta) {
 			return false
 		}
 	}
@@ -183,8 +176,8 @@ func (fi *FullIngress) IsEqual(resource Resource) bool {
 	return true
 }
 
-// FullMinion holds a Minion resource.
-type FullMinion struct {
+// MinionConfiguration holds a Minion resource.
+type MinionConfiguration struct {
 	// Ingress is the Ingress behind a minion.
 	Ingress *networking.Ingress
 	// ValidPaths marks the paths of the Ingress as valid (true) or invalid (false).
@@ -193,24 +186,24 @@ type FullMinion struct {
 	ValidPaths map[string]bool
 }
 
-// NewFullMinion creates a new FullMinion.
-func NewFullMinion(ing *networking.Ingress) *FullMinion {
-	return &FullMinion{
+// NewMinionConfiguration creates a new MinionConfiguration.
+func NewMinionConfiguration(ing *networking.Ingress) *MinionConfiguration {
+	return &MinionConfiguration{
 		Ingress:    ing,
 		ValidPaths: make(map[string]bool),
 	}
 }
 
-// FullVirtualServer holds a VirtualServer along with its VirtualServerRoutes.
-type FullVirtualServer struct {
+// VirtualServerConfiguration holds a VirtualServer along with its VirtualServerRoutes.
+type VirtualServerConfiguration struct {
 	VirtualServer       *conf_v1.VirtualServer
 	VirtualServerRoutes []*conf_v1.VirtualServerRoute
 	Warnings            []string
 }
 
-// NewFullVirtualServer creates a NewFullVirtualServer.
-func NewFullVirtualServer(vs *conf_v1.VirtualServer, vsrs []*conf_v1.VirtualServerRoute, warnings []string) *FullVirtualServer {
-	return &FullVirtualServer{
+// NewVirtualServerConfiguration creates a VirtualServerConfiguration.
+func NewVirtualServerConfiguration(vs *conf_v1.VirtualServer, vsrs []*conf_v1.VirtualServerRoute, warnings []string) *VirtualServerConfiguration {
+	return &VirtualServerConfiguration{
 		VirtualServer:       vs,
 		VirtualServerRoutes: vsrs,
 		Warnings:            warnings,
@@ -218,59 +211,95 @@ func NewFullVirtualServer(vs *conf_v1.VirtualServer, vsrs []*conf_v1.VirtualServ
 }
 
 // GetObjectMeta returns the resource ObjectMeta.
-func (fvs *FullVirtualServer) GetObjectMeta() *metav1.ObjectMeta {
-	return &fvs.VirtualServer.ObjectMeta
+func (vsc *VirtualServerConfiguration) GetObjectMeta() *metav1.ObjectMeta {
+	return &vsc.VirtualServer.ObjectMeta
 }
 
 // GetKeyWithKind returns the key of the resource with its kind. For example, VirtualServer/my-namespace/my-name.
-func (fvs *FullVirtualServer) GetKeyWithKind() string {
-	key := getResourceKey(&fvs.VirtualServer.ObjectMeta)
+func (vsc *VirtualServerConfiguration) GetKeyWithKind() string {
+	key := getResourceKey(&vsc.VirtualServer.ObjectMeta)
 	return fmt.Sprintf("%s/%s", virtualServerKind, key)
-}
-
-// AcquireHost acquires the host for this resource.
-func (fvs *FullVirtualServer) AcquireHost(host string) {
-	// we do nothing because we don't need to track which host belongs to VirtualServer, in contrast with the Ingress resource.
-}
-
-// ReleaseHost releases the host.
-func (fvs *FullVirtualServer) ReleaseHost(host string) {
-	// we do nothing because we don't need to track which host belongs to VirtualServer, in contrast with the Ingress resource.
 }
 
 // Wins tells if this resource wins over the specified resource.
 // It is used to determine which resource should win over a host.
-func (fvs *FullVirtualServer) Wins(resource Resource) bool {
-	return chooseObjectMetaWinner(fvs.GetObjectMeta(), resource.GetObjectMeta())
+func (vsc *VirtualServerConfiguration) Wins(resource Resource) bool {
+	return chooseObjectMetaWinner(vsc.GetObjectMeta(), resource.GetObjectMeta())
 }
 
 // AddWarning adds a warning.
-func (fvs *FullVirtualServer) AddWarning(warning string) {
-	fvs.Warnings = append(fvs.Warnings, warning)
+func (vsc *VirtualServerConfiguration) AddWarning(warning string) {
+	vsc.Warnings = append(vsc.Warnings, warning)
 }
 
-// IsEqual tests if the FullVirtualServer is equal to the resource.
-func (fvs *FullVirtualServer) IsEqual(resource Resource) bool {
-	fullVS, ok := resource.(*FullVirtualServer)
+// IsEqual tests if the VirtualServerConfiguration is equal to the resource.
+func (vsc *VirtualServerConfiguration) IsEqual(resource Resource) bool {
+	vsConfig, ok := resource.(*VirtualServerConfiguration)
 	if !ok {
 		return false
 	}
 
-	if !compareObjectMetas(&fvs.VirtualServer.ObjectMeta, &fullVS.VirtualServer.ObjectMeta) {
+	if !compareObjectMetas(&vsc.VirtualServer.ObjectMeta, &vsConfig.VirtualServer.ObjectMeta) {
 		return false
 	}
 
-	if len(fvs.VirtualServerRoutes) != len(fullVS.VirtualServerRoutes) {
+	if len(vsc.VirtualServerRoutes) != len(vsConfig.VirtualServerRoutes) {
 		return false
 	}
 
-	for i := range fvs.VirtualServerRoutes {
-		if !compareObjectMetas(&fvs.VirtualServerRoutes[i].ObjectMeta, &fullVS.VirtualServerRoutes[i].ObjectMeta) {
+	for i := range vsc.VirtualServerRoutes {
+		if !compareObjectMetas(&vsc.VirtualServerRoutes[i].ObjectMeta, &vsConfig.VirtualServerRoutes[i].ObjectMeta) {
 			return false
 		}
 	}
 
 	return true
+}
+
+// TransportServerConfiguration holds a TransportServer resource.
+type TransportServerConfiguration struct {
+	ListenerPort    int
+	TransportServer *conf_v1alpha1.TransportServer
+	Warnings        []string
+}
+
+// NewTransportServerConfiguration creates a new TransportServerConfiguration.
+func NewTransportServerConfiguration(ts *conf_v1alpha1.TransportServer) *TransportServerConfiguration {
+	return &TransportServerConfiguration{
+		TransportServer: ts,
+	}
+}
+
+// GetObjectMeta returns the resource ObjectMeta.
+func (tsc *TransportServerConfiguration) GetObjectMeta() *metav1.ObjectMeta {
+	return &tsc.TransportServer.ObjectMeta
+}
+
+// GetKeyWithKind returns the key of the resource with its kind. For example, TransportServer/my-namespace/my-name.
+func (tsc *TransportServerConfiguration) GetKeyWithKind() string {
+	key := getResourceKey(&tsc.TransportServer.ObjectMeta)
+	return fmt.Sprintf("%s/%s", transportServerKind, key)
+}
+
+// Wins tells if this resource wins over the specified resource.
+// It is used to determine which resource should win over a host or port.
+func (tsc *TransportServerConfiguration) Wins(resource Resource) bool {
+	return chooseObjectMetaWinner(tsc.GetObjectMeta(), resource.GetObjectMeta())
+}
+
+// AddWarning adds a warning.
+func (tsc *TransportServerConfiguration) AddWarning(warning string) {
+	tsc.Warnings = append(tsc.Warnings, warning)
+}
+
+// IsEqual tests if the TransportServerConfiguration is equal to the resource.
+func (tsc *TransportServerConfiguration) IsEqual(resource Resource) bool {
+	tsConfig, ok := resource.(*TransportServerConfiguration)
+	if !ok {
+		return false
+	}
+
+	return compareObjectMetas(tsc.GetObjectMeta(), resource.GetObjectMeta()) && tsc.ListenerPort == tsConfig.ListenerPort
 }
 
 func compareObjectMetas(meta1 *metav1.ObjectMeta, meta2 *metav1.ObjectMeta) bool {
@@ -289,42 +318,73 @@ func compareObjectMetasWithAnnotations(meta1 *metav1.ObjectMeta, meta2 *metav1.O
 // The IC needs to ensure that at any point in time the NGINX config on the filesystem reflects the state
 // of the objects in the Configuration.
 type Configuration struct {
-	hosts map[string]Resource
+	hosts     map[string]Resource
+	listeners map[string]*TransportServerConfiguration
 
 	// only valid resources with the matching IngressClass are stored
 	ingresses           map[string]*networking.Ingress
 	virtualServers      map[string]*conf_v1.VirtualServer
 	virtualServerRoutes map[string]*conf_v1.VirtualServerRoute
+	transportServers    map[string]*conf_v1alpha1.TransportServer
 
-	problems map[string]ConfigurationProblem
+	globalConfiguration *conf_v1alpha1.GlobalConfiguration
 
-	hasCorrectIngressClass func(interface{}) bool
-	virtualServerValidator *validation.VirtualServerValidator
+	hostProblems     map[string]ConfigurationProblem
+	listenerProblems map[string]ConfigurationProblem
+
+	hasCorrectIngressClass       func(interface{}) bool
+	virtualServerValidator       *validation.VirtualServerValidator
+	globalConfigurationValidator *validation.GlobalConfigurationValidator
+	transportServerValidator     *validation.TransportServerValidator
 
 	secretReferenceChecker     *secretReferenceChecker
 	serviceReferenceChecker    *serviceReferenceChecker
+	endpointReferenceChecker   *serviceReferenceChecker
 	policyReferenceChecker     *policyReferenceChecker
 	appPolicyReferenceChecker  *appProtectResourceReferenceChecker
 	appLogConfReferenceChecker *appProtectResourceReferenceChecker
+
+	isPlus                  bool
+	appProtectEnabled       bool
+	internalRoutesEnabled   bool
+	isTLSPassthroughEnabled bool
 
 	lock sync.RWMutex
 }
 
 // NewConfiguration creates a new Configuration.
-func NewConfiguration(hasCorrectIngressClass func(interface{}) bool, isPlus bool, virtualServerValidator *validation.VirtualServerValidator) *Configuration {
+func NewConfiguration(
+	hasCorrectIngressClass func(interface{}) bool,
+	isPlus bool,
+	appProtectEnabled bool,
+	internalRoutesEnabled bool,
+	virtualServerValidator *validation.VirtualServerValidator,
+	globalConfigurationValidator *validation.GlobalConfigurationValidator,
+	transportServerValidator *validation.TransportServerValidator,
+	isTLSPassthroughEnabled bool,
+) *Configuration {
 	return &Configuration{
-		hosts:                      make(map[string]Resource),
-		ingresses:                  make(map[string]*networking.Ingress),
-		virtualServers:             make(map[string]*conf_v1.VirtualServer),
-		virtualServerRoutes:        make(map[string]*conf_v1.VirtualServerRoute),
-		problems:                   make(map[string]ConfigurationProblem),
-		hasCorrectIngressClass:     hasCorrectIngressClass,
-		virtualServerValidator:     virtualServerValidator,
-		secretReferenceChecker:     newSecretReferenceChecker(isPlus),
-		serviceReferenceChecker:    newServiceReferenceChecker(),
-		policyReferenceChecker:     newPolicyReferenceChecker(),
-		appPolicyReferenceChecker:  newAppProtectResourceReferenceChecker(configs.AppProtectPolicyAnnotation),
-		appLogConfReferenceChecker: newAppProtectResourceReferenceChecker(configs.AppProtectLogConfAnnotation),
+		hosts:                        make(map[string]Resource),
+		listeners:                    make(map[string]*TransportServerConfiguration),
+		ingresses:                    make(map[string]*networking.Ingress),
+		virtualServers:               make(map[string]*conf_v1.VirtualServer),
+		virtualServerRoutes:          make(map[string]*conf_v1.VirtualServerRoute),
+		transportServers:             make(map[string]*conf_v1alpha1.TransportServer),
+		hostProblems:                 make(map[string]ConfigurationProblem),
+		hasCorrectIngressClass:       hasCorrectIngressClass,
+		virtualServerValidator:       virtualServerValidator,
+		globalConfigurationValidator: globalConfigurationValidator,
+		transportServerValidator:     transportServerValidator,
+		secretReferenceChecker:       newSecretReferenceChecker(isPlus),
+		serviceReferenceChecker:      newServiceReferenceChecker(false),
+		endpointReferenceChecker:     newServiceReferenceChecker(true),
+		policyReferenceChecker:       newPolicyReferenceChecker(),
+		appPolicyReferenceChecker:    newAppProtectResourceReferenceChecker(configs.AppProtectPolicyAnnotation),
+		appLogConfReferenceChecker:   newAppProtectResourceReferenceChecker(configs.AppProtectLogConfAnnotation),
+		isPlus:                       isPlus,
+		appProtectEnabled:            appProtectEnabled,
+		internalRoutesEnabled:        internalRoutesEnabled,
+		isTLSPassthroughEnabled:      isTLSPassthroughEnabled,
 	}
 }
 
@@ -339,7 +399,7 @@ func (c *Configuration) AddOrUpdateIngress(ing *networking.Ingress) ([]ResourceC
 	if !c.hasCorrectIngressClass(ing) {
 		delete(c.ingresses, key)
 	} else {
-		validationError = validateIngress(ing).ToAggregate()
+		validationError = validateIngress(ing, c.isPlus, c.appProtectEnabled, c.internalRoutesEnabled).ToAggregate()
 		if validationError != nil {
 			delete(c.ingresses, key)
 		} else {
@@ -347,10 +407,10 @@ func (c *Configuration) AddOrUpdateIngress(ing *networking.Ingress) ([]ResourceC
 		}
 	}
 
-	changes, problems := c.rebuild()
+	changes, problems := c.rebuildHosts()
 
 	if validationError != nil {
-		// If the invalid resource has any active hosts, rebuild will create a change
+		// If the invalid resource has any active hosts, rebuildHosts will create a change
 		// to remove the resource.
 		// Here we add the validationErr to that change.
 		keyWithKind := getResourceKeyWithKind(ingressKind, &ing.ObjectMeta)
@@ -365,7 +425,7 @@ func (c *Configuration) AddOrUpdateIngress(ing *networking.Ingress) ([]ResourceC
 
 		// On the other hand, the invalid resource might not have any active hosts.
 		// Or the resource was invalid before and is still invalid (in some different way).
-		// In those cases,  rebuild will create no change for that resource.
+		// In those cases,  rebuildHosts will create no change for that resource.
 		// To make sure the validationErr is reported to the user, we create a problem.
 		p := ConfigurationProblem{
 			Object:  ing,
@@ -391,7 +451,7 @@ func (c *Configuration) DeleteIngress(key string) ([]ResourceChange, []Configura
 
 	delete(c.ingresses, key)
 
-	return c.rebuild()
+	return c.rebuildHosts()
 }
 
 // AddOrUpdateVirtualServer adds or updates the VirtualServer resource.
@@ -413,10 +473,10 @@ func (c *Configuration) AddOrUpdateVirtualServer(vs *conf_v1.VirtualServer) ([]R
 		}
 	}
 
-	changes, problems := c.rebuild()
+	changes, problems := c.rebuildHosts()
 
 	if validationError != nil {
-		// If the invalid resource has an active host, rebuild will create a change
+		// If the invalid resource has an active host, rebuildHosts will create a change
 		// to remove the resource.
 		// Here we add the validationErr to that change.
 		kind := getResourceKeyWithKind(virtualServerKind, &vs.ObjectMeta)
@@ -431,7 +491,7 @@ func (c *Configuration) AddOrUpdateVirtualServer(vs *conf_v1.VirtualServer) ([]R
 
 		// On the other hand, the invalid resource might not have any active host.
 		// Or the resource was invalid before and is still invalid (in some different way).
-		// In those cases,  rebuild will create no change for that resource.
+		// In those cases,  rebuildHosts will create no change for that resource.
 		// To make sure the validationErr is reported to the user, we create a problem.
 		p := ConfigurationProblem{
 			Object:  vs,
@@ -457,7 +517,7 @@ func (c *Configuration) DeleteVirtualServer(key string) ([]ResourceChange, []Con
 
 	delete(c.virtualServers, key)
 
-	return c.rebuild()
+	return c.rebuildHosts()
 }
 
 // AddOrUpdateVirtualServerRoute adds or updates the VirtualServerRoute.
@@ -479,7 +539,7 @@ func (c *Configuration) AddOrUpdateVirtualServerRoute(vsr *conf_v1.VirtualServer
 		}
 	}
 
-	changes, problems := c.rebuild()
+	changes, problems := c.rebuildHosts()
 
 	if validationError != nil {
 		p := ConfigurationProblem{
@@ -506,7 +566,200 @@ func (c *Configuration) DeleteVirtualServerRoute(key string) ([]ResourceChange, 
 
 	delete(c.virtualServerRoutes, key)
 
-	return c.rebuild()
+	return c.rebuildHosts()
+}
+
+// AddOrUpdateGlobalConfiguration adds or updates the GlobalConfiguration.
+func (c *Configuration) AddOrUpdateGlobalConfiguration(gc *conf_v1alpha1.GlobalConfiguration) ([]ResourceChange, []ConfigurationProblem, error) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	validationErr := c.globalConfigurationValidator.ValidateGlobalConfiguration(gc)
+	if validationErr != nil {
+		c.globalConfiguration = nil
+	} else {
+		c.globalConfiguration = gc
+	}
+
+	changes, problems := c.rebuildListeners()
+
+	return changes, problems, validationErr
+}
+
+// DeleteGlobalConfiguration deletes GlobalConfiguration.
+func (c *Configuration) DeleteGlobalConfiguration() ([]ResourceChange, []ConfigurationProblem) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	c.globalConfiguration = nil
+	changes, problems := c.rebuildListeners()
+
+	return changes, problems
+}
+
+// AddOrUpdateTransportServer adds or updates the TransportServer.
+func (c *Configuration) AddOrUpdateTransportServer(ts *conf_v1alpha1.TransportServer) ([]ResourceChange, []ConfigurationProblem) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	key := getResourceKey(&ts.ObjectMeta)
+	var validationErr error
+
+	if !c.hasCorrectIngressClass(ts) {
+		delete(c.transportServers, key)
+	} else {
+		validationErr = c.transportServerValidator.ValidateTransportServer(ts)
+		if validationErr != nil {
+			delete(c.transportServers, key)
+		} else {
+			c.transportServers[key] = ts
+		}
+	}
+
+	changes, problems := c.rebuildListeners()
+
+	if c.isTLSPassthroughEnabled {
+		hostChanges, hostProblems := c.rebuildHosts()
+
+		changes = append(changes, hostChanges...)
+		problems = append(problems, hostProblems...)
+	}
+
+	if validationErr != nil {
+		// If the invalid resource has an active host/listener, rebuildHosts/rebuildListeners will create a change
+		// to remove the resource.
+		// Here we add the validationErr to that change.
+		kind := getResourceKeyWithKind(transportServerKind, &ts.ObjectMeta)
+		for i := range changes {
+			k := changes[i].Resource.GetKeyWithKind()
+
+			if k == kind {
+				changes[i].Error = validationErr.Error()
+				return changes, problems
+			}
+		}
+
+		// On the other hand, the invalid resource might not have any active host/listener.
+		// Or the resource was invalid before and is still invalid (in some different way).
+		// In those cases,  rebuildHosts/rebuildListeners will create no change for that resource.
+		// To make sure the validationErr is reported to the user, we create a problem.
+		p := ConfigurationProblem{
+			Object:  ts,
+			IsError: true,
+			Reason:  "Rejected",
+			Message: fmt.Sprintf("TransportServer %s was rejected with error: %s", getResourceKey(&ts.ObjectMeta), validationErr.Error()),
+		}
+		problems = append(problems, p)
+	}
+
+	return changes, problems
+}
+
+// DeleteTransportServer deletes a TransportServer by the key.
+func (c *Configuration) DeleteTransportServer(key string) ([]ResourceChange, []ConfigurationProblem) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	_, exists := c.transportServers[key]
+	if !exists {
+		return nil, nil
+	}
+
+	delete(c.transportServers, key)
+
+	changes, problems := c.rebuildListeners()
+
+	if c.isTLSPassthroughEnabled {
+		hostChanges, hostProblems := c.rebuildHosts()
+
+		changes = append(changes, hostChanges...)
+		problems = append(problems, hostProblems...)
+	}
+
+	return changes, problems
+}
+
+func (c *Configuration) rebuildListeners() ([]ResourceChange, []ConfigurationProblem) {
+	newListeners, newTSConfigs := c.buildListenersAndTSConfigurations()
+
+	removedListeners, updatedListeners, addedListeners := detectChangesInListeners(c.listeners, newListeners)
+	changes := createResourceChangesForListeners(removedListeners, updatedListeners, addedListeners, c.listeners, newListeners)
+
+	c.listeners = newListeners
+
+	changes = squashResourceChanges(changes)
+
+	// Note that the change will not refer to the latest version, if the TransportServerConfiguration is being removed.
+	// However, referring to the latest version is necessary so that the resource latest Warnings are reported and not lost.
+	// So here we make sure that changes always refer to the latest version of TransportServerConfigurations.
+	for i := range changes {
+		key := changes[i].Resource.GetKeyWithKind()
+		if r, exists := newTSConfigs[key]; exists {
+			changes[i].Resource = r
+		}
+	}
+
+	newProblems := make(map[string]ConfigurationProblem)
+
+	c.addProblemsForTSConfigsWithoutActiveListener(newTSConfigs, newProblems)
+
+	newOrUpdatedProblems := detectChangesInProblems(newProblems, c.listenerProblems)
+
+	// safe to update problems
+	c.listenerProblems = newProblems
+
+	return changes, newOrUpdatedProblems
+}
+
+func (c *Configuration) buildListenersAndTSConfigurations() (newListeners map[string]*TransportServerConfiguration, newTSConfigs map[string]*TransportServerConfiguration) {
+	newListeners = make(map[string]*TransportServerConfiguration)
+	newTSConfigs = make(map[string]*TransportServerConfiguration)
+
+	for key, ts := range c.transportServers {
+		if ts.Spec.Listener.Protocol == conf_v1alpha1.TLSPassthroughListenerProtocol {
+			continue
+		}
+
+		tsc := NewTransportServerConfiguration(ts)
+		newTSConfigs[key] = tsc
+
+		if c.globalConfiguration == nil {
+			continue
+		}
+
+		found := false
+		var listener conf_v1alpha1.Listener
+		for _, l := range c.globalConfiguration.Spec.Listeners {
+			if ts.Spec.Listener.Name == l.Name && ts.Spec.Listener.Protocol == l.Protocol {
+				listener = l
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			continue
+		}
+
+		tsc.ListenerPort = listener.Port
+
+		holder, exists := newListeners[listener.Name]
+		if !exists {
+			newListeners[listener.Name] = tsc
+			continue
+		}
+
+		warning := fmt.Sprintf("listener %s is taken by another resource", listener.Name)
+
+		if !holder.Wins(tsc) {
+			holder.AddWarning(warning)
+			newListeners[listener.Name] = tsc
+		} else {
+			tsc.AddWarning(warning)
+		}
+	}
+
+	return newListeners, newTSConfigs
 }
 
 // GetResources returns all configuration resources.
@@ -531,11 +784,11 @@ func (c *Configuration) GetResourcesWithFilter(filter resourceFilter) []Resource
 
 	for _, r := range c.hosts {
 		switch r.(type) {
-		case *FullIngress:
+		case *IngressConfiguration:
 			if filter.Ingresses {
 				resources[r.GetKeyWithKind()] = r
 			}
-		case *FullVirtualServer:
+		case *VirtualServerConfiguration:
 			if filter.VirtualServers {
 				resources[r.GetKeyWithKind()] = r
 			}
@@ -558,7 +811,7 @@ func (c *Configuration) FindResourcesForService(svcNamespace string, svcName str
 // FindResourcesForEndpoints finds resources that reference the specified endpoints.
 func (c *Configuration) FindResourcesForEndpoints(endpointsNamespace string, endpointsName string) []Resource {
 	// Resources reference not endpoints but the corresponding service, which has the same namespace and name
-	return c.FindResourcesForService(endpointsNamespace, endpointsName)
+	return c.findResourcesForResourceReference(endpointsNamespace, endpointsName, c.endpointReferenceChecker)
 }
 
 // FindResourcesForSecret finds resources that reference the specified secret.
@@ -571,13 +824,13 @@ func (c *Configuration) FindResourcesForPolicy(policyNamespace string, policyNam
 	return c.findResourcesForResourceReference(policyNamespace, policyName, c.policyReferenceChecker)
 }
 
-// FindResourcesForAppProtectPolicy finds resources that reference the specified AppProtect policy.
-func (c *Configuration) FindResourcesForAppProtectPolicy(policyNamespace string, policyName string) []Resource {
+// FindResourcesForAppProtectPolicyAnnotation finds resources that reference the specified AppProtect policy via annotation.
+func (c *Configuration) FindResourcesForAppProtectPolicyAnnotation(policyNamespace string, policyName string) []Resource {
 	return c.findResourcesForResourceReference(policyNamespace, policyName, c.appPolicyReferenceChecker)
 }
 
-// FindResourcesForAppProtectLogConf finds resources that reference the specified AppProtect LogConf.
-func (c *Configuration) FindResourcesForAppProtectLogConf(logConfNamespace string, logConfName string) []Resource {
+// FindResourcesForAppProtectLogConfAnnotation finds resources that reference the specified AppProtect LogConf.
+func (c *Configuration) FindResourcesForAppProtectLogConfAnnotation(logConfNamespace string, logConfName string) []Resource {
 	return c.findResourcesForResourceReference(logConfNamespace, logConfName, c.appLogConfReferenceChecker)
 }
 
@@ -591,7 +844,7 @@ func (c *Configuration) findResourcesForResourceReference(namespace string, name
 		r := c.hosts[h]
 
 		switch impl := r.(type) {
-		case *FullIngress:
+		case *IngressConfiguration:
 			if checker.IsReferencedByIngress(namespace, name, impl.Ingress) {
 				result = append(result, r)
 				continue
@@ -603,7 +856,7 @@ func (c *Configuration) findResourcesForResourceReference(namespace string, name
 					break
 				}
 			}
-		case *FullVirtualServer:
+		case *VirtualServerConfiguration:
 			if checker.IsReferencedByVirtualServer(namespace, name, impl.VirtualServer) {
 				result = append(result, r)
 				continue
@@ -615,6 +868,20 @@ func (c *Configuration) findResourcesForResourceReference(namespace string, name
 					break
 				}
 			}
+		case *TransportServerConfiguration:
+			if checker.IsReferencedByTransportServer(namespace, name, impl.TransportServer) {
+				result = append(result, r)
+				continue
+			}
+		}
+	}
+
+	for _, l := range getSortedTransportServerConfigurationKeys(c.listeners) {
+		tsConfig := c.listeners[l]
+
+		if checker.IsReferencedByTransportServer(namespace, name, tsConfig.TransportServer) {
+			result = append(result, tsConfig)
+			continue
 		}
 	}
 
@@ -625,12 +892,14 @@ func getResourceKey(meta *metav1.ObjectMeta) string {
 	return fmt.Sprintf("%s/%s", meta.Namespace, meta.Name)
 }
 
-// rebuild rebuilds the Configuration and returns the changes to it and the new problems.
-func (c *Configuration) rebuild() ([]ResourceChange, []ConfigurationProblem) {
+// rebuildHosts rebuilds the Configuration and returns the changes to it and the new problems.
+func (c *Configuration) rebuildHosts() ([]ResourceChange, []ConfigurationProblem) {
 	newHosts, newResources := c.buildHostsAndResources()
 
+	updateActiveHostsForIngresses(newHosts, newResources)
+
 	removedHosts, updatedHosts, addedHosts := detectChangesInHosts(c.hosts, newHosts)
-	changes := c.createResourceChanges(removedHosts, updatedHosts, addedHosts, newHosts)
+	changes := createResourceChangesForHosts(removedHosts, updatedHosts, addedHosts, c.hosts, newHosts)
 
 	// safe to update hosts
 	c.hosts = newHosts
@@ -653,12 +922,26 @@ func (c *Configuration) rebuild() ([]ResourceChange, []ConfigurationProblem) {
 	c.addProblemsForOrphanMinions(newProblems)
 	c.addProblemsForOrphanOrIgnoredVsrs(newProblems)
 
-	newOrUpdatedProblems := detectChangesInProblems(newProblems, c.problems)
+	newOrUpdatedProblems := detectChangesInProblems(newProblems, c.hostProblems)
 
 	// safe to update problems
-	c.problems = newProblems
+	c.hostProblems = newProblems
 
 	return changes, newOrUpdatedProblems
+}
+
+func updateActiveHostsForIngresses(hosts map[string]Resource, resources map[string]Resource) {
+	for _, r := range resources {
+		ingConfig, ok := r.(*IngressConfiguration)
+		if !ok {
+			continue
+		}
+
+		for _, rule := range ingConfig.Ingress.Spec.Rules {
+			res := hosts[rule.Host]
+			ingConfig.ValidHosts[rule.Host] = res.GetKeyWithKind() == r.GetKeyWithKind()
+		}
+	}
 }
 
 func detectChangesInProblems(newProblems map[string]ConfigurationProblem, oldProblems map[string]ConfigurationProblem) []ConfigurationProblem {
@@ -681,12 +964,36 @@ func detectChangesInProblems(newProblems map[string]ConfigurationProblem, oldPro
 	return result
 }
 
-func (c *Configuration) addProblemsForResourcesWithoutActiveHost(resources map[string]Resource, problems map[string]ConfigurationProblem) {
-	for _, k := range getSortedResourceKeys(resources) {
-		r := resources[k]
+func (c *Configuration) addProblemsForTSConfigsWithoutActiveListener(tsConfigs map[string]*TransportServerConfiguration, problems map[string]ConfigurationProblem) {
+	for _, tsc := range tsConfigs {
+		holder, exists := c.listeners[tsc.TransportServer.Spec.Listener.Name]
+		if !exists {
+			p := ConfigurationProblem{
+				Object:  tsc.TransportServer,
+				IsError: false,
+				Reason:  "Rejected",
+				Message: fmt.Sprintf("Listener %s doesn't exist", tsc.TransportServer.Spec.Listener.Name),
+			}
+			problems[tsc.GetKeyWithKind()] = p
+			continue
+		}
 
+		if !tsc.IsEqual(holder) {
+			p := ConfigurationProblem{
+				Object:  tsc.TransportServer,
+				IsError: false,
+				Reason:  "Rejected",
+				Message: fmt.Sprintf("Listener %s is taken by another resource", tsc.TransportServer.Spec.Listener.Name),
+			}
+			problems[tsc.GetKeyWithKind()] = p
+		}
+	}
+}
+
+func (c *Configuration) addProblemsForResourcesWithoutActiveHost(resources map[string]Resource, problems map[string]ConfigurationProblem) {
+	for _, r := range resources {
 		switch impl := r.(type) {
-		case *FullIngress:
+		case *IngressConfiguration:
 			atLeastOneValidHost := false
 			for _, v := range impl.ValidHosts {
 				if v {
@@ -703,16 +1010,24 @@ func (c *Configuration) addProblemsForResourcesWithoutActiveHost(resources map[s
 				}
 				problems[r.GetKeyWithKind()] = p
 			}
-		case *FullVirtualServer:
-			res, exists := c.hosts[impl.VirtualServer.Spec.Host]
-
-			if !exists {
-				continue
-			}
+		case *VirtualServerConfiguration:
+			res := c.hosts[impl.VirtualServer.Spec.Host]
 
 			if res.GetKeyWithKind() != r.GetKeyWithKind() {
 				p := ConfigurationProblem{
 					Object:  impl.VirtualServer,
+					IsError: false,
+					Reason:  "Rejected",
+					Message: "Host is taken by another resource",
+				}
+				problems[r.GetKeyWithKind()] = p
+			}
+		case *TransportServerConfiguration:
+			res := c.hosts[impl.TransportServer.Spec.Host]
+
+			if res.GetKeyWithKind() != r.GetKeyWithKind() {
+				p := ConfigurationProblem{
+					Object:  impl.TransportServer,
 					IsError: false,
 					Reason:  "Rejected",
 					Message: "Host is taken by another resource",
@@ -732,9 +1047,9 @@ func (c *Configuration) addProblemsForOrphanMinions(problems map[string]Configur
 		}
 
 		r, exists := c.hosts[ing.Spec.Rules[0].Host]
-		fullIngress, ok := r.(*FullIngress)
+		ingressConf, ok := r.(*IngressConfiguration)
 
-		if !exists || !ok || !fullIngress.IsMaster {
+		if !exists || !ok || !ingressConf.IsMaster {
 			p := ConfigurationProblem{
 				Object:  ing,
 				IsError: false,
@@ -752,7 +1067,7 @@ func (c *Configuration) addProblemsForOrphanOrIgnoredVsrs(problems map[string]Co
 		vsr := c.virtualServerRoutes[key]
 
 		r, exists := c.hosts[vsr.Spec.Host]
-		fullVS, ok := r.(*FullVirtualServer)
+		vsConfig, ok := r.(*VirtualServerConfiguration)
 
 		if !exists || !ok {
 			p := ConfigurationProblem{
@@ -767,7 +1082,7 @@ func (c *Configuration) addProblemsForOrphanOrIgnoredVsrs(problems map[string]Co
 		}
 
 		found := false
-		for _, v := range fullVS.VirtualServerRoutes {
+		for _, v := range vsConfig.VirtualServerRoutes {
 			if vsr.Namespace == v.Namespace && vsr.Name == v.Name {
 				found = true
 				break
@@ -779,7 +1094,7 @@ func (c *Configuration) addProblemsForOrphanOrIgnoredVsrs(problems map[string]Co
 				Object:  vsr,
 				IsError: false,
 				Reason:  "Ignored",
-				Message: fmt.Sprintf("VirtualServer %s ignores VirtualServerRoute", getResourceKey(&fullVS.VirtualServer.ObjectMeta)),
+				Message: fmt.Sprintf("VirtualServer %s ignores VirtualServerRoute", getResourceKey(&vsConfig.VirtualServer.ObjectMeta)),
 			}
 			k := getResourceKeyWithKind(virtualServerRouteKind, &vsr.ObjectMeta)
 			problems[k] = p
@@ -791,23 +1106,23 @@ func getResourceKeyWithKind(kind string, objectMeta *metav1.ObjectMeta) string {
 	return fmt.Sprintf("%s/%s/%s", kind, objectMeta.Namespace, objectMeta.Name)
 }
 
-func (c *Configuration) createResourceChanges(removedHosts []string, updatedHosts []string, addedHosts []string, newHosts map[string]Resource) []ResourceChange {
+func createResourceChangesForHosts(removedHosts []string, updatedHosts []string, addedHosts []string, oldHosts map[string]Resource, newHosts map[string]Resource) []ResourceChange {
 	var changes []ResourceChange
 	var deleteChanges []ResourceChange
 
 	for _, h := range removedHosts {
 		change := ResourceChange{
 			Op:       Delete,
-			Resource: c.hosts[h],
+			Resource: oldHosts[h],
 		}
 		deleteChanges = append(deleteChanges, change)
 	}
 
 	for _, h := range updatedHosts {
-		if c.hosts[h].GetKeyWithKind() != newHosts[h].GetKeyWithKind() {
+		if oldHosts[h].GetKeyWithKind() != newHosts[h].GetKeyWithKind() {
 			deleteChange := ResourceChange{
 				Op:       Delete,
-				Resource: c.hosts[h],
+				Resource: oldHosts[h],
 			}
 			deleteChanges = append(deleteChanges, deleteChange)
 		}
@@ -831,6 +1146,50 @@ func (c *Configuration) createResourceChanges(removedHosts []string, updatedHost
 	// This way an addOrUpdate change, which might include a resource that uses the same host as a resource
 	// in a delete change, will be processed only after the config of the delete change is removed.
 	// That will prevent any host collisions in the NGINX config in the state between the changes.
+	return append(deleteChanges, changes...)
+}
+
+func createResourceChangesForListeners(removedListeners []string, updatedListeners []string, addedListeners []string, oldListeners map[string]*TransportServerConfiguration,
+	newListeners map[string]*TransportServerConfiguration) []ResourceChange {
+	var changes []ResourceChange
+	var deleteChanges []ResourceChange
+
+	for _, l := range removedListeners {
+		change := ResourceChange{
+			Op:       Delete,
+			Resource: oldListeners[l],
+		}
+		deleteChanges = append(deleteChanges, change)
+	}
+
+	for _, l := range updatedListeners {
+		if oldListeners[l].GetKeyWithKind() != newListeners[l].GetKeyWithKind() {
+			deleteChange := ResourceChange{
+				Op:       Delete,
+				Resource: oldListeners[l],
+			}
+			deleteChanges = append(deleteChanges, deleteChange)
+		}
+
+		change := ResourceChange{
+			Op:       AddOrUpdate,
+			Resource: newListeners[l],
+		}
+		changes = append(changes, change)
+	}
+
+	for _, l := range addedListeners {
+		change := ResourceChange{
+			Op:       AddOrUpdate,
+			Resource: newListeners[l],
+		}
+		changes = append(changes, change)
+	}
+
+	// We need to ensure that delete changes come first.
+	// This way an addOrUpdate change, which might include a resource that uses the same listener as a resource
+	// in a delete change, will be processed only after the config of the delete change is removed.
+	// That will prevent any listener collisions in the NGINX config in the state between the changes.
 	return append(deleteChanges, changes...)
 }
 
@@ -870,9 +1229,9 @@ func squashResourceChanges(changes []ResourceChange) []ResourceChange {
 	}
 
 	// We need to ensure that delete changes come first.
-	// This way an addOrUpdate change, which might include a resource that uses the same host as a resource
+	// This way an addOrUpdate change, which might include a resource that uses the same host/listener as a resource
 	// in a delete change, will be processed only after the config of the delete change is removed.
-	// That will prevent any host collisions in the NGINX config in the state between the changes.
+	// That will prevent any host/listener collisions in the NGINX config in the state between the changes.
 	return append(deletes, updates...)
 }
 
@@ -889,13 +1248,13 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 			continue
 		}
 
-		var resource *FullIngress
+		var resource *IngressConfiguration
 
 		if isMaster(ing) {
-			minions, childWarnings := c.buildFullMinions(ing.Spec.Rules[0].Host)
-			resource = NewMasterFullIngress(ing, minions, childWarnings)
+			minions, childWarnings := c.buildMinionConfigs(ing.Spec.Rules[0].Host)
+			resource = NewMasterIngressConfiguration(ing, minions, childWarnings)
 		} else {
-			resource = NewRegularFullIngress(ing)
+			resource = NewRegularIngressConfiguration(ing)
 		}
 
 		newResources[resource.GetKeyWithKind()] = resource
@@ -904,17 +1263,14 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 			holder, exists := newHosts[rule.Host]
 			if !exists {
 				newHosts[rule.Host] = resource
-				resource.AcquireHost(rule.Host)
 				continue
 			}
 
 			warning := fmt.Sprintf("host %s is taken by another resource", rule.Host)
 
 			if !holder.Wins(resource) {
-				holder.ReleaseHost(rule.Host)
 				holder.AddWarning(warning)
 				newHosts[rule.Host] = resource
-				resource.AcquireHost(rule.Host)
 			} else {
 				resource.AddWarning(warning)
 			}
@@ -927,36 +1283,63 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 		vs := c.virtualServers[key]
 
 		vsrs, warnings := c.buildVirtualServerRoutes(vs)
-		resource := NewFullVirtualServer(vs, vsrs, warnings)
+		resource := NewVirtualServerConfiguration(vs, vsrs, warnings)
 
 		newResources[resource.GetKeyWithKind()] = resource
 
 		holder, exists := newHosts[vs.Spec.Host]
 		if !exists {
 			newHosts[vs.Spec.Host] = resource
-			resource.AcquireHost(vs.Spec.Host)
 			continue
 		}
 
 		warning := fmt.Sprintf("host %s is taken by another resource", vs.Spec.Host)
 
 		if !holder.Wins(resource) {
-			holder.ReleaseHost(vs.Spec.Host)
 			newHosts[vs.Spec.Host] = resource
-			resource.AcquireHost(vs.Spec.Host)
 			holder.AddWarning(warning)
 		} else {
 			resource.AddWarning(warning)
 		}
 	}
 
+	// Step - 3 - Build hosts from TransportServer resources if TLS Passthrough is enabled
+
+	if c.isTLSPassthroughEnabled {
+		for _, key := range getSortedTransportServerKeys(c.transportServers) {
+			ts := c.transportServers[key]
+
+			if ts.Spec.Listener.Name != conf_v1alpha1.TLSPassthroughListenerName && ts.Spec.Listener.Protocol != conf_v1alpha1.TLSPassthroughListenerProtocol {
+				continue
+			}
+
+			resource := NewTransportServerConfiguration(ts)
+			newResources[resource.GetKeyWithKind()] = resource
+
+			holder, exists := newHosts[ts.Spec.Host]
+			if !exists {
+				newHosts[ts.Spec.Host] = resource
+				continue
+			}
+
+			warning := fmt.Sprintf("host %s is taken by another resource", ts.Spec.Host)
+
+			if !holder.Wins(resource) {
+				newHosts[ts.Spec.Host] = resource
+				holder.AddWarning(warning)
+			} else {
+				resource.AddWarning(warning)
+			}
+		}
+	}
+
 	return newHosts, newResources
 }
 
-func (c *Configuration) buildFullMinions(masterHost string) ([]*FullMinion, map[string][]string) {
-	var fullMinions []*FullMinion
+func (c *Configuration) buildMinionConfigs(masterHost string) ([]*MinionConfiguration, map[string][]string) {
+	var minionConfigs []*MinionConfiguration
 	childWarnings := make(map[string][]string)
-	paths := make(map[string]*FullMinion)
+	paths := make(map[string]*MinionConfiguration)
 
 	for _, minionKey := range getSortedIngressKeys(c.ingresses) {
 		ingress := c.ingresses[minionKey]
@@ -969,35 +1352,35 @@ func (c *Configuration) buildFullMinions(masterHost string) ([]*FullMinion, map[
 			continue
 		}
 
-		fullMinion := NewFullMinion(ingress)
+		minionConfig := NewMinionConfiguration(ingress)
 
 		for _, p := range ingress.Spec.Rules[0].HTTP.Paths {
 			holder, exists := paths[p.Path]
 			if !exists {
-				paths[p.Path] = fullMinion
-				fullMinion.ValidPaths[p.Path] = true
+				paths[p.Path] = minionConfig
+				minionConfig.ValidPaths[p.Path] = true
 				continue
 			}
 
 			warning := fmt.Sprintf("path %s is taken by another resource", p.Path)
 
 			if !chooseObjectMetaWinner(&holder.Ingress.ObjectMeta, &ingress.ObjectMeta) {
-				paths[p.Path] = fullMinion
-				fullMinion.ValidPaths[p.Path] = true
+				paths[p.Path] = minionConfig
+				minionConfig.ValidPaths[p.Path] = true
 
 				holder.ValidPaths[p.Path] = false
 				key := getResourceKey(&holder.Ingress.ObjectMeta)
 				childWarnings[key] = append(childWarnings[key], warning)
 			} else {
-				key := getResourceKey(&fullMinion.Ingress.ObjectMeta)
+				key := getResourceKey(&minionConfig.Ingress.ObjectMeta)
 				childWarnings[key] = append(childWarnings[key], warning)
 			}
 		}
 
-		fullMinions = append(fullMinions, fullMinion)
+		minionConfigs = append(minionConfigs, minionConfig)
 	}
 
-	return fullMinions, childWarnings
+	return minionConfigs, childWarnings
 }
 
 func (c *Configuration) buildVirtualServerRoutes(vs *conf_v1.VirtualServer) ([]*conf_v1.VirtualServerRoute, []string) {
@@ -1096,6 +1479,30 @@ func getSortedResourceKeys(m map[string]Resource) []string {
 	return keys
 }
 
+func getSortedTransportServerKeys(m map[string]*conf_v1alpha1.TransportServer) []string {
+	var keys []string
+
+	for k := range m {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	return keys
+}
+
+func getSortedTransportServerConfigurationKeys(m map[string]*TransportServerConfiguration) []string {
+	var keys []string
+
+	for k := range m {
+		keys = append(keys, k)
+	}
+
+	sort.Strings(keys)
+
+	return keys
+}
+
 func detectChangesInHosts(oldHosts map[string]Resource, newHosts map[string]Resource) (removedHosts []string, updatedHosts []string, addedHosts []string) {
 	for _, h := range getSortedResourceKeys(oldHosts) {
 		_, exists := newHosts[h]
@@ -1123,4 +1530,34 @@ func detectChangesInHosts(oldHosts map[string]Resource, newHosts map[string]Reso
 	}
 
 	return removedHosts, updatedHosts, addedHosts
+}
+
+func detectChangesInListeners(oldListeners map[string]*TransportServerConfiguration, newListeners map[string]*TransportServerConfiguration) (removedListeners []string,
+	updatedListeners []string, addedListeners []string) {
+	for _, l := range getSortedTransportServerConfigurationKeys(oldListeners) {
+		_, exists := newListeners[l]
+		if !exists {
+			removedListeners = append(removedListeners, l)
+		}
+	}
+
+	for _, l := range getSortedTransportServerConfigurationKeys(newListeners) {
+		_, exists := oldListeners[l]
+		if !exists {
+			addedListeners = append(addedListeners, l)
+		}
+	}
+
+	for _, l := range getSortedTransportServerConfigurationKeys(newListeners) {
+		oldR, exists := oldListeners[l]
+		if !exists {
+			continue
+		}
+
+		if !oldR.IsEqual(newListeners[l]) {
+			updatedListeners = append(updatedListeners, l)
+		}
+	}
+
+	return removedListeners, updatedListeners, addedListeners
 }

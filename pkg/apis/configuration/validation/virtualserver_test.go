@@ -309,10 +309,17 @@ func TestValidateUpstreams(t *testing.T) {
 					ProxyNextUpstreamTimeout: "10s",
 					ProxyNextUpstreamTries:   5,
 				},
+				{
+					Name:         "upstream3",
+					Service:      "test-3",
+					Port:         80,
+					UseClusterIP: true,
+				},
 			},
 			expectedUpstreamNames: map[string]sets.Empty{
 				"upstream1": {},
 				"upstream2": {},
+				"upstream3": {},
 			},
 			msg: "2 valid upstreams",
 		},
@@ -541,6 +548,21 @@ func TestValidateUpstreamsFails(t *testing.T) {
 				"upstream1": {},
 			},
 			msg: "invalid value for subselector",
+		},
+		{
+			upstreams: []v1.Upstream{
+				{
+					Name:         "upstream1",
+					Service:      "test-1",
+					Subselector:  map[string]string{"version": "test"},
+					UseClusterIP: true,
+					Port:         80,
+				},
+			},
+			expectedUpstreamNames: map[string]sets.Empty{
+				"upstream1": {},
+			},
+			msg: "invalid use of subselector with use-cluster-ip",
 		},
 	}
 
@@ -2252,33 +2274,6 @@ func TestValidatePositiveIntOrZeroFails(t *testing.T) {
 	}
 }
 
-func TestValidateTime(t *testing.T) {
-	time := "1h 2s"
-	allErrs := validateTime(time, field.NewPath("time-field"))
-
-	if len(allErrs) != 0 {
-		t.Errorf("validateTime returned errors %v valid input %v", allErrs, time)
-	}
-}
-
-func TestValidateOffset(t *testing.T) {
-	var validInput = []string{"", "1", "10k", "11m", "1K", "100M", "5G"}
-	for _, test := range validInput {
-		allErrs := validateOffset(test, field.NewPath("offset-field"))
-		if len(allErrs) != 0 {
-			t.Errorf("validateOffset(%q) returned an error for valid input", test)
-		}
-	}
-
-	var invalidInput = []string{"55mm", "2mG", "6kb", "-5k", "1L", "5Gb"}
-	for _, test := range invalidInput {
-		allErrs := validateOffset(test, field.NewPath("offset-field"))
-		if len(allErrs) == 0 {
-			t.Errorf("validateOffset(%q) didn't return error for invalid input.", test)
-		}
-	}
-}
-
 func TestValidateBuffer(t *testing.T) {
 	validbuff := &v1.UpstreamBuffers{Number: 8, Size: "8k"}
 	allErrs := validateBuffer(validbuff, field.NewPath("buffers-field"))
@@ -2306,15 +2301,6 @@ func TestValidateBuffer(t *testing.T) {
 		if len(allErrs) == 0 {
 			t.Errorf("validateBuffer didn't return error for invalid input %v.", test)
 		}
-	}
-}
-
-func TestValidateTimeFails(t *testing.T) {
-	time := "invalid"
-	allErrs := validateTime(time, field.NewPath("time-field"))
-
-	if len(allErrs) == 0 {
-		t.Errorf("validateTime returned no errors for invalid input %v", time)
 	}
 }
 
@@ -3608,6 +3594,7 @@ func TestValidateErrorPageReturn(t *testing.T) {
 	vsv := &VirtualServerValidator{isPlus: false}
 
 	for _, epr := range tests {
+		// FIXME #nosec G601
 		allErrs := vsv.validateErrorPageReturn(&epr, field.NewPath("return"))
 		if len(allErrs) != 0 {
 			t.Errorf("validateErrorPageReturn(%v) returned errors for valid input: %v", epr, allErrs)
@@ -3697,6 +3684,7 @@ func TestValidateErrorPageRedirect(t *testing.T) {
 	vsv := &VirtualServerValidator{isPlus: false}
 
 	for _, epr := range tests {
+		// FIXME #nosec G601
 		allErrs := vsv.validateErrorPageRedirect(&epr, field.NewPath("redirect"))
 		if len(allErrs) != 0 {
 			t.Errorf("validateErrorPageRedirect(%v) returned errors for valid input: %v", epr, allErrs)
@@ -3741,6 +3729,7 @@ func TestValidateErrorPageRedirectFails(t *testing.T) {
 	vsv := &VirtualServerValidator{isPlus: false}
 
 	for _, epr := range tests {
+		// FIXME #nosec G601
 		allErrs := vsv.validateErrorPageRedirect(&epr, field.NewPath("redirect"))
 		if len(allErrs) == 0 {
 			t.Errorf("validateErrorPageRedirect(%v) returned no errors for invalid input", epr)
@@ -3791,7 +3780,8 @@ func TestValidateErrorPageHeaderFails(t *testing.T) {
 		{
 			Name:  "Header-Name",
 			Value: "${invalid_var}",
-		}, {
+		},
+		{
 			Name:  "Header-Name",
 			Value: `unescaped "`,
 		},

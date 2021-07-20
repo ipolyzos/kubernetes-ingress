@@ -6,9 +6,11 @@ import (
 	"strings"
 
 	"github.com/golang/glog"
+	"github.com/nginxinc/kubernetes-ingress/internal/k8s/secrets"
 	"github.com/nginxinc/kubernetes-ingress/internal/nginx"
 	conf_v1alpha1 "github.com/nginxinc/kubernetes-ingress/pkg/apis/configuration/v1alpha1"
 	api_v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 
@@ -54,14 +56,13 @@ type PodInfo struct {
 type VirtualServerEx struct {
 	VirtualServer       *conf_v1.VirtualServer
 	Endpoints           map[string][]string
-	TLSSecret           *api_v1.Secret
-	JWTKeys             map[string]*api_v1.Secret
-	IngressMTLSCert     *api_v1.Secret
-	EgressTLSSecrets    map[string]*api_v1.Secret
 	VirtualServerRoutes []*conf_v1.VirtualServerRoute
 	ExternalNameSvcs    map[string]bool
-	Policies            map[string]*conf_v1alpha1.Policy
+	Policies            map[string]*conf_v1.Policy
 	PodsByIP            map[string]PodInfo
+	SecretRefs          map[string]*secrets.SecretReference
+	ApPolRefs           map[string]*unstructured.Unstructured
+	LogConfRefs         map[string]*unstructured.Unstructured
 }
 
 func (vsx *VirtualServerEx) String() string {
@@ -77,7 +78,12 @@ func (vsx *VirtualServerEx) String() string {
 }
 
 // GenerateEndpointsKey generates a key for the Endpoints map in VirtualServerEx.
-func GenerateEndpointsKey(serviceNamespace string, serviceName string, subselector map[string]string, port uint16) string {
+func GenerateEndpointsKey(
+	serviceNamespace string,
+	serviceName string,
+	subselector map[string]string,
+	port uint16,
+) string {
 	if len(subselector) > 0 {
 		return fmt.Sprintf("%s/%s_%s:%d", serviceNamespace, serviceName, labels.Set(subselector).String(), port)
 	}
@@ -96,9 +102,18 @@ func newUpstreamNamerForVirtualServer(virtualServer *conf_v1.VirtualServer) *ups
 	}
 }
 
-func newUpstreamNamerForVirtualServerRoute(virtualServer *conf_v1.VirtualServer, virtualServerRoute *conf_v1.VirtualServerRoute) *upstreamNamer {
+func newUpstreamNamerForVirtualServerRoute(
+	virtualServer *conf_v1.VirtualServer,
+	virtualServerRoute *conf_v1.VirtualServerRoute,
+) *upstreamNamer {
 	return &upstreamNamer{
-		prefix:    fmt.Sprintf("vs_%s_%s_vsr_%s_%s", virtualServer.Namespace, virtualServer.Name, virtualServerRoute.Namespace, virtualServerRoute.Name),
+		prefix: fmt.Sprintf(
+			"vs_%s_%s_vsr_%s_%s",
+			virtualServer.Namespace,
+			virtualServer.Name,
+			virtualServerRoute.Namespace,
+			virtualServerRoute.Name,
+		),
 		namespace: virtualServerRoute.Namespace,
 	}
 }
@@ -139,7 +154,11 @@ func (namer *variableNamer) GetNameForSplitClientVariable(index int) string {
 	return fmt.Sprintf("$vs_%s_splits_%d", namer.safeNsName, index)
 }
 
-func (namer *variableNamer) GetNameForVariableForMatchesRouteMap(matchesIndex int, matchIndex int, conditionIndex int) string {
+func (namer *variableNamer) GetNameForVariableForMatchesRouteMap(
+	matchesIndex int,
+	matchIndex int,
+	conditionIndex int,
+) string {
 	return fmt.Sprintf("$vs_%s_matches_%d_match_%d_cond_%d", namer.safeNsName, matchesIndex, matchIndex, conditionIndex)
 }
 
@@ -147,7 +166,11 @@ func (namer *variableNamer) GetNameForVariableForMatchesRouteMainMap(matchesInde
 	return fmt.Sprintf("$vs_%s_matches_%d", namer.safeNsName, matchesIndex)
 }
 
-func newHealthCheckWithDefaults(upstream conf_v1.Upstream, upstreamName string, cfgParams *ConfigParams) *version2.HealthCheck {
+func newHealthCheckWithDefaults(
+	upstream conf_v1.Upstream,
+	upstreamName string,
+	cfgParams *ConfigParams,
+) *version2.HealthCheck {
 	return &version2.HealthCheck{
 		Name:                upstreamName,
 		URI:                 "/",
@@ -157,9 +180,9 @@ func newHealthCheckWithDefaults(upstream conf_v1.Upstream, upstreamName string, 
 		Passes:              1,
 		Port:                int(upstream.Port),
 		ProxyPass:           fmt.Sprintf("%v://%v", generateProxyPassProtocol(upstream.TLS.Enable), upstreamName),
-		ProxyConnectTimeout: generateString(upstream.ProxyConnectTimeout, cfgParams.ProxyConnectTimeout),
-		ProxyReadTimeout:    generateString(upstream.ProxyReadTimeout, cfgParams.ProxyReadTimeout),
-		ProxySendTimeout:    generateString(upstream.ProxySendTimeout, cfgParams.ProxySendTimeout),
+		ProxyConnectTimeout: generateTimeWithDefault(upstream.ProxyConnectTimeout, cfgParams.ProxyConnectTimeout),
+		ProxyReadTimeout:    generateTimeWithDefault(upstream.ProxyReadTimeout, cfgParams.ProxyReadTimeout),
+		ProxySendTimeout:    generateTimeWithDefault(upstream.ProxySendTimeout, cfgParams.ProxySendTimeout),
 		Headers:             make(map[string]string),
 	}
 }
@@ -173,10 +196,22 @@ type virtualServerConfigurator struct {
 	enableSnippets       bool
 	warnings             Warnings
 	spiffeCerts          bool
+	oidcPolCfg           *oidcPolicyCfg
+}
+
+type oidcPolicyCfg struct {
+	oidc *version2.OIDC
+	key  string
 }
 
 func (vsc *virtualServerConfigurator) addWarningf(obj runtime.Object, msgFmt string, args ...interface{}) {
-	vsc.warnings[obj] = append(vsc.warnings[obj], fmt.Sprintf(msgFmt, args...))
+	vsc.warnings.AddWarningf(obj, msgFmt, args...)
+}
+
+func (vsc *virtualServerConfigurator) addWarnings(obj runtime.Object, msgs []string) {
+	for _, msg := range msgs {
+		vsc.warnings.AddWarning(obj, msg)
+	}
 }
 
 func (vsc *virtualServerConfigurator) clearWarnings() {
@@ -184,7 +219,12 @@ func (vsc *virtualServerConfigurator) clearWarnings() {
 }
 
 // newVirtualServerConfigurator creates a new VirtualServerConfigurator
-func newVirtualServerConfigurator(cfgParams *ConfigParams, isPlus bool, isResolverConfigured bool, staticParams *StaticConfigParams) *virtualServerConfigurator {
+func newVirtualServerConfigurator(
+	cfgParams *ConfigParams,
+	isPlus bool,
+	isResolverConfigured bool,
+	staticParams *StaticConfigParams,
+) *virtualServerConfigurator {
 	return &virtualServerConfigurator{
 		cfgParams:            cfgParams,
 		isPlus:               isPlus,
@@ -193,10 +233,16 @@ func newVirtualServerConfigurator(cfgParams *ConfigParams, isPlus bool, isResolv
 		enableSnippets:       staticParams.EnableSnippets,
 		warnings:             make(map[runtime.Object][]string),
 		spiffeCerts:          staticParams.NginxServiceMesh,
+		oidcPolCfg:           &oidcPolicyCfg{},
 	}
 }
 
-func (vsc *virtualServerConfigurator) generateEndpointsForUpstream(owner runtime.Object, namespace string, upstream conf_v1.Upstream, virtualServerEx *VirtualServerEx) []string {
+func (vsc *virtualServerConfigurator) generateEndpointsForUpstream(
+	owner runtime.Object,
+	namespace string,
+	upstream conf_v1.Upstream,
+	virtualServerEx *VirtualServerEx,
+) []string {
 	endpointsKey := GenerateEndpointsKey(namespace, upstream.Service, upstream.Subselector, upstream.Port)
 	externalNameSvcKey := GenerateExternalNameSvcKey(namespace, upstream.Service)
 	endpoints := virtualServerEx.Endpoints[endpointsKey]
@@ -215,11 +261,25 @@ func (vsc *virtualServerConfigurator) generateEndpointsForUpstream(owner runtime
 }
 
 // GenerateVirtualServerConfig generates a full configuration for a VirtualServer
-func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualServerEx, tlsPemFileName string, jwtKeys map[string]string, ingressMTLSPemFileName string, egressMTLSSecrets map[string]string) (version2.VirtualServerConfig, Warnings) {
+func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualServerEx, apResources map[string]string) (version2.VirtualServerConfig, Warnings) {
 	vsc.clearWarnings()
 
-	policiesCfg := vsc.generatePolicies(vsEx.VirtualServer, vsEx.VirtualServer.Namespace, vsEx.VirtualServer.Namespace,
-		vsEx.VirtualServer.Name, vsEx.VirtualServer.Spec.Policies, vsEx.Policies, jwtKeys, ingressMTLSPemFileName, specContext, tlsPemFileName, egressMTLSSecrets)
+	sslConfig := vsc.generateSSLConfig(vsEx.VirtualServer, vsEx.VirtualServer.Spec.TLS, vsEx.VirtualServer.Namespace, vsEx.SecretRefs, vsc.cfgParams)
+	tlsRedirectConfig := generateTLSRedirectConfig(vsEx.VirtualServer.Spec.TLS)
+
+	policyOpts := policyOptions{
+		tls:         sslConfig != nil,
+		secretRefs:  vsEx.SecretRefs,
+		apResources: apResources,
+	}
+
+	ownerDetails := policyOwnerDetails{
+		owner:          vsEx.VirtualServer,
+		ownerNamespace: vsEx.VirtualServer.Namespace,
+		vsNamespace:    vsEx.VirtualServer.Namespace,
+		vsName:         vsEx.VirtualServer.Name,
+	}
+	policiesCfg := vsc.generatePolicies(ownerDetails, vsEx.VirtualServer.Spec.Policies, vsEx.Policies, specContext, policyOpts)
 
 	// crUpstreams maps an UpstreamName to its conf_v1.Upstream as they are generated
 	// necessary for generateLocation to know what Upstream each Location references
@@ -250,7 +310,10 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 		if hc := generateHealthCheck(u, upstreamName, vsc.cfgParams); hc != nil {
 			healthChecks = append(healthChecks, *hc)
 			if u.HealthCheck.StatusMatch != "" {
-				statusMatches = append(statusMatches, generateUpstreamStatusMatch(upstreamName, u.HealthCheck.StatusMatch))
+				statusMatches = append(
+					statusMatches,
+					generateUpstreamStatusMatch(upstreamName, u.HealthCheck.StatusMatch),
+				)
 			}
 		}
 	}
@@ -272,7 +335,10 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 			if hc := generateHealthCheck(u, upstreamName, vsc.cfgParams); hc != nil {
 				healthChecks = append(healthChecks, *hc)
 				if u.HealthCheck.StatusMatch != "" {
-					statusMatches = append(statusMatches, generateUpstreamStatusMatch(upstreamName, u.HealthCheck.StatusMatch))
+					statusMatches = append(
+						statusMatches,
+						generateUpstreamStatusMatch(upstreamName, u.HealthCheck.StatusMatch),
+					)
 				}
 			}
 		}
@@ -284,10 +350,11 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 	var splitClients []version2.SplitClient
 	var maps []version2.Map
 	var errorPageLocations []version2.ErrorPageLocation
-	var vsrErrorPagesFromVs = make(map[string][]conf_v1.ErrorPage)
-	var vsrErrorPagesRouteIndex = make(map[string]int)
-	var vsrLocationSnippetsFromVs = make(map[string]string)
-	var vsrPoliciesFromVs = make(map[string][]conf_v1.PolicyReference)
+	vsrErrorPagesFromVs := make(map[string][]conf_v1.ErrorPage)
+	vsrErrorPagesRouteIndex := make(map[string]int)
+	vsrLocationSnippetsFromVs := make(map[string]string)
+	vsrPoliciesFromVs := make(map[string][]conf_v1.PolicyReference)
+	isVSR := false
 	matchesRoutes := 0
 
 	variableNamer := newVariableNamer(vsEx.VirtualServer)
@@ -324,14 +391,35 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 		}
 
 		vsLocSnippets := r.LocationSnippets
-		// ingressMTLSPemFileName argument is always empty for route policies
-		routePoliciesCfg := vsc.generatePolicies(vsEx.VirtualServer, vsEx.VirtualServer.Namespace, vsEx.VirtualServer.Namespace, vsEx.VirtualServer.Name,
-			r.Policies, vsEx.Policies, jwtKeys, "", routeContext, tlsPemFileName, egressMTLSSecrets)
+		ownerDetails := policyOwnerDetails{
+			owner:          vsEx.VirtualServer,
+			ownerNamespace: vsEx.VirtualServer.Namespace,
+			vsNamespace:    vsEx.VirtualServer.Namespace,
+			vsName:         vsEx.VirtualServer.Name,
+		}
+		routePoliciesCfg := vsc.generatePolicies(ownerDetails, r.Policies, vsEx.Policies, routeContext, policyOpts)
+		if policiesCfg.OIDC {
+			routePoliciesCfg.OIDC = policiesCfg.OIDC
+		}
 		limitReqZones = append(limitReqZones, routePoliciesCfg.LimitReqZones...)
 
 		if len(r.Matches) > 0 {
-			cfg := generateMatchesConfig(r, virtualServerUpstreamNamer, crUpstreams, variableNamer, matchesRoutes, len(splitClients),
-				vsc.cfgParams, r.ErrorPages, errorPageIndex, vsLocSnippets, vsc.enableSnippets, len(returnLocations))
+			cfg := generateMatchesConfig(
+				r,
+				virtualServerUpstreamNamer,
+				crUpstreams,
+				variableNamer,
+				matchesRoutes,
+				len(splitClients),
+				vsc.cfgParams,
+				r.ErrorPages,
+				errorPageIndex,
+				vsLocSnippets,
+				vsc.enableSnippets,
+				len(returnLocations),
+				isVSR,
+				"", "",
+			)
 			addPoliciesCfgToLocations(routePoliciesCfg, cfg.Locations)
 
 			maps = append(maps, cfg.Maps...)
@@ -342,7 +430,7 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 			matchesRoutes++
 		} else if len(r.Splits) > 0 {
 			cfg := generateDefaultSplitsConfig(r, virtualServerUpstreamNamer, crUpstreams, variableNamer, len(splitClients),
-				vsc.cfgParams, r.ErrorPages, errorPageIndex, r.Path, vsLocSnippets, vsc.enableSnippets, len(returnLocations))
+				vsc.cfgParams, r.ErrorPages, errorPageIndex, r.Path, vsLocSnippets, vsc.enableSnippets, len(returnLocations), isVSR, "", "")
 			addPoliciesCfgToLocations(routePoliciesCfg, cfg.Locations)
 
 			splitClients = append(splitClients, cfg.SplitClients...)
@@ -356,7 +444,7 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 			proxySSLName := generateProxySSLName(upstream.Service, vsEx.VirtualServer.Namespace)
 
 			loc, returnLoc := generateLocation(r.Path, upstreamName, upstream, r.Action, vsc.cfgParams, r.ErrorPages, false,
-				errorPageIndex, proxySSLName, r.Path, vsLocSnippets, vsc.enableSnippets, len(returnLocations))
+				errorPageIndex, proxySSLName, r.Path, vsLocSnippets, vsc.enableSnippets, len(returnLocations), isVSR, "", "")
 			addPoliciesCfgToLocation(routePoliciesCfg, &loc)
 
 			locations = append(locations, loc)
@@ -368,6 +456,7 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 
 	// generate config for subroutes of each VirtualServerRoute
 	for _, vsr := range vsEx.VirtualServerRoutes {
+		isVSR := true
 		upstreamNamer := newUpstreamNamerForVirtualServerRoute(vsEx.VirtualServer, vsr)
 		for _, r := range vsr.Spec.Subroutes {
 			errorPageIndex := len(errorPageLocations)
@@ -387,19 +476,53 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 			if r.LocationSnippets == "" {
 				locSnippets = vsrLocationSnippetsFromVs[vsrNamespaceName]
 			}
-			// ingressMTLSPemFileName argument is always empty for route policies
-			routePoliciesCfg := vsc.generatePolicies(vsr, vsr.Namespace, vsEx.VirtualServer.Namespace, vsEx.VirtualServer.Name,
-				r.Policies, vsEx.Policies, jwtKeys, "", subRouteContext, tlsPemFileName, egressMTLSSecrets)
-			// use the VirtualServer route policies if the route does not define any
+
+			var ownerDetails policyOwnerDetails
+			var policyRefs []conf_v1.PolicyReference
+			var context string
 			if len(r.Policies) == 0 {
-				routePoliciesCfg = vsc.generatePolicies(vsEx.VirtualServer, vsEx.VirtualServer.Namespace, vsEx.VirtualServer.Namespace,
-					vsEx.VirtualServer.Name, vsrPoliciesFromVs[vsrNamespaceName], vsEx.Policies, jwtKeys, "", routeContext, tlsPemFileName, egressMTLSSecrets)
+				// use the VirtualServer route policies if the route does not define any
+				ownerDetails = policyOwnerDetails{
+					owner:          vsEx.VirtualServer,
+					ownerNamespace: vsEx.VirtualServer.Namespace,
+					vsNamespace:    vsEx.VirtualServer.Namespace,
+					vsName:         vsEx.VirtualServer.Name,
+				}
+				policyRefs = vsrPoliciesFromVs[vsrNamespaceName]
+				context = routeContext
+			} else {
+				ownerDetails = policyOwnerDetails{
+					owner:          vsr,
+					ownerNamespace: vsr.Namespace,
+					vsNamespace:    vsEx.VirtualServer.Namespace,
+					vsName:         vsEx.VirtualServer.Name,
+				}
+				policyRefs = r.Policies
+				context = subRouteContext
+			}
+			routePoliciesCfg := vsc.generatePolicies(ownerDetails, policyRefs, vsEx.Policies, context, policyOpts)
+			if policiesCfg.OIDC {
+				routePoliciesCfg.OIDC = policiesCfg.OIDC
 			}
 			limitReqZones = append(limitReqZones, routePoliciesCfg.LimitReqZones...)
-
 			if len(r.Matches) > 0 {
-				cfg := generateMatchesConfig(r, upstreamNamer, crUpstreams, variableNamer, matchesRoutes, len(splitClients),
-					vsc.cfgParams, errorPages, errorPageIndex, locSnippets, vsc.enableSnippets, len(returnLocations))
+				cfg := generateMatchesConfig(
+					r,
+					upstreamNamer,
+					crUpstreams,
+					variableNamer,
+					matchesRoutes,
+					len(splitClients),
+					vsc.cfgParams,
+					errorPages,
+					errorPageIndex,
+					locSnippets,
+					vsc.enableSnippets,
+					len(returnLocations),
+					isVSR,
+					vsr.Name,
+					vsr.Namespace,
+				)
 				addPoliciesCfgToLocations(routePoliciesCfg, cfg.Locations)
 
 				maps = append(maps, cfg.Maps...)
@@ -410,7 +533,7 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 				matchesRoutes++
 			} else if len(r.Splits) > 0 {
 				cfg := generateDefaultSplitsConfig(r, upstreamNamer, crUpstreams, variableNamer, len(splitClients), vsc.cfgParams,
-					errorPages, errorPageIndex, r.Path, locSnippets, vsc.enableSnippets, len(returnLocations))
+					errorPages, errorPageIndex, r.Path, locSnippets, vsc.enableSnippets, len(returnLocations), isVSR, vsr.Name, vsr.Namespace)
 				addPoliciesCfgToLocations(routePoliciesCfg, cfg.Locations)
 
 				splitClients = append(splitClients, cfg.SplitClients...)
@@ -423,7 +546,7 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 				proxySSLName := generateProxySSLName(upstream.Service, vsr.Namespace)
 
 				loc, returnLoc := generateLocation(r.Path, upstreamName, upstream, r.Action, vsc.cfgParams, errorPages, false,
-					errorPageIndex, proxySSLName, r.Path, locSnippets, vsc.enableSnippets, len(returnLocations))
+					errorPageIndex, proxySSLName, r.Path, locSnippets, vsc.enableSnippets, len(returnLocations), isVSR, vsr.Name, vsr.Namespace)
 				addPoliciesCfgToLocation(routePoliciesCfg, &loc)
 
 				locations = append(locations, loc)
@@ -434,10 +557,12 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 		}
 	}
 
-	ssl := generateSSLConfig(vsEx.VirtualServer.Spec.TLS, tlsPemFileName, vsc.cfgParams)
-	tlsRedirectConfig := generateTLSRedirectConfig(vsEx.VirtualServer.Spec.TLS)
-	httpSnippets := generateSnippets(vsc.enableSnippets, vsEx.VirtualServer.Spec.HTTPSnippets, []string{""})
-	serverSnippets := generateSnippets(vsc.enableSnippets, vsEx.VirtualServer.Spec.ServerSnippets, vsc.cfgParams.ServerSnippets)
+	httpSnippets := generateSnippets(vsc.enableSnippets, vsEx.VirtualServer.Spec.HTTPSnippets, []string{})
+	serverSnippets := generateSnippets(
+		vsc.enableSnippets,
+		vsEx.VirtualServer.Spec.ServerSnippets,
+		vsc.cfgParams.ServerSnippets,
+	)
 
 	vsCfg := version2.VirtualServerConfig{
 		Upstreams:     upstreams,
@@ -450,7 +575,7 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 			ServerName:                vsEx.VirtualServer.Spec.Host,
 			StatusZone:                vsEx.VirtualServer.Spec.Host,
 			ProxyProtocol:             vsc.cfgParams.ProxyProtocol,
-			SSL:                       ssl,
+			SSL:                       sslConfig,
 			ServerTokens:              vsc.cfgParams.ServerTokens,
 			SetRealIPFrom:             vsc.cfgParams.SetRealIPFrom,
 			RealIPHeader:              vsc.cfgParams.RealIPHeader,
@@ -470,7 +595,11 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(vsEx *VirtualS
 			JWTAuth:                   policiesCfg.JWTAuth,
 			IngressMTLS:               policiesCfg.IngressMTLS,
 			EgressMTLS:                policiesCfg.EgressMTLS,
+			OIDC:                      vsc.oidcPolCfg.oidc,
+			WAF:                       policiesCfg.WAF,
 			PoliciesErrorReturn:       policiesCfg.ErrorReturn,
+			VSNamespace:               vsEx.VirtualServer.Namespace,
+			VSName:                    vsEx.VirtualServer.Name,
 		},
 		SpiffeCerts: vsc.spiffeCerts,
 	}
@@ -487,175 +616,447 @@ type policiesCfg struct {
 	JWTAuth         *version2.JWTAuth
 	IngressMTLS     *version2.IngressMTLS
 	EgressMTLS      *version2.EgressMTLS
+	OIDC            bool
+	WAF             *version2.WAF
 	ErrorReturn     *version2.Return
 }
 
-// TODO refactor generatePolicies
-func (vsc *virtualServerConfigurator) generatePolicies(owner runtime.Object, ownerNamespace string, vsNamespace string,
-	vsName string, policyRefs []conf_v1.PolicyReference, policies map[string]*conf_v1alpha1.Policy, jwtKeys map[string]string, ingressMTLSPemFileName string, context string, tlsPemFileName string, egressMTLSSecrets map[string]string) policiesCfg {
-	var policyErrorReturn *version2.Return
-	var allow, deny []string
-	var limitReqOptions version2.LimitReqOptions
-	var limitReqZones []version2.LimitReqZone
-	var limitReqs []version2.LimitReq
-	var JWTAuth *version2.JWTAuth
-	var ingressMTLS *version2.IngressMTLS
-	var egressMTLS *version2.EgressMTLS
-	var policyError bool
+func newPoliciesConfig() *policiesCfg {
+	return &policiesCfg{}
+}
+
+type policyOwnerDetails struct {
+	owner          runtime.Object
+	ownerNamespace string
+	vsNamespace    string
+	vsName         string
+}
+
+type policyOptions struct {
+	tls         bool
+	secretRefs  map[string]*secrets.SecretReference
+	apResources map[string]string
+}
+
+type validationResults struct {
+	isError  bool
+	warnings []string
+}
+
+func newValidationResults() *validationResults {
+	return &validationResults{}
+}
+
+func (v *validationResults) addWarningf(msgFmt string, args ...interface{}) {
+	v.warnings = append(v.warnings, fmt.Sprintf(msgFmt, args...))
+}
+
+func (p *policiesCfg) addAccessControlConfig(accessControl *conf_v1.AccessControl) *validationResults {
+	res := newValidationResults()
+	p.Allow = append(p.Allow, accessControl.Allow...)
+	p.Deny = append(p.Deny, accessControl.Deny...)
+	if len(p.Allow) > 0 && len(p.Deny) > 0 {
+		res.addWarningf(
+			"AccessControl policy (or policies) with deny rules is overridden by policy (or policies) with allow rules",
+		)
+	}
+	return res
+}
+
+func (p *policiesCfg) addRateLimitConfig(
+	rateLimit *conf_v1.RateLimit,
+	polKey string,
+	polNamespace string,
+	polName string,
+	vsNamespace string,
+	vsName string,
+) *validationResults {
+	res := newValidationResults()
+	rlZoneName := fmt.Sprintf("pol_rl_%v_%v_%v_%v", polNamespace, polName, vsNamespace, vsName)
+	p.LimitReqs = append(p.LimitReqs, generateLimitReq(rlZoneName, rateLimit))
+	p.LimitReqZones = append(p.LimitReqZones, generateLimitReqZone(rlZoneName, rateLimit))
+	if len(p.LimitReqs) == 1 {
+		p.LimitReqOptions = generateLimitReqOptions(rateLimit)
+	} else {
+		curOptions := generateLimitReqOptions(rateLimit)
+		if curOptions.DryRun != p.LimitReqOptions.DryRun {
+			res.addWarningf("RateLimit policy %s with limit request option dryRun='%v' is overridden to dryRun='%v' by the first policy reference in this context", polKey, curOptions.DryRun, p.LimitReqOptions.DryRun)
+		}
+		if curOptions.LogLevel != p.LimitReqOptions.LogLevel {
+			res.addWarningf("RateLimit policy %s with limit request option logLevel='%v' is overridden to logLevel='%v' by the first policy reference in this context", polKey, curOptions.LogLevel, p.LimitReqOptions.LogLevel)
+		}
+		if curOptions.RejectCode != p.LimitReqOptions.RejectCode {
+			res.addWarningf("RateLimit policy %s with limit request option rejectCode='%v' is overridden to rejectCode='%v' by the first policy reference in this context", polKey, curOptions.RejectCode, p.LimitReqOptions.RejectCode)
+		}
+	}
+	return res
+}
+
+func (p *policiesCfg) addJWTAuthConfig(
+	jwtAuth *conf_v1.JWTAuth,
+	polKey string,
+	polNamespace string,
+	secretRefs map[string]*secrets.SecretReference,
+) *validationResults {
+	res := newValidationResults()
+	if p.JWTAuth != nil {
+		res.addWarningf("Multiple jwt policies in the same context is not valid. JWT policy %s will be ignored", polKey)
+		return res
+	}
+
+	jwtSecretKey := fmt.Sprintf("%v/%v", polNamespace, jwtAuth.Secret)
+	secretRef := secretRefs[jwtSecretKey]
+	var secretType api_v1.SecretType
+	if secretRef.Secret != nil {
+		secretType = secretRef.Secret.Type
+	}
+	if secretType != "" && secretType != secrets.SecretTypeJWK {
+		res.addWarningf("JWT policy %s references a secret %s of a wrong type '%s', must be '%s'", polKey, jwtSecretKey, secretType, secrets.SecretTypeJWK)
+		res.isError = true
+		return res
+	} else if secretRef.Error != nil {
+		res.addWarningf("JWT policy %s references an invalid secret %s: %v", polKey, jwtSecretKey, secretRef.Error)
+		res.isError = true
+		return res
+	}
+
+	p.JWTAuth = &version2.JWTAuth{
+		Secret: secretRef.Path,
+		Realm:  jwtAuth.Realm,
+		Token:  jwtAuth.Token,
+	}
+	return res
+}
+
+func (p *policiesCfg) addIngressMTLSConfig(
+	ingressMTLS *conf_v1.IngressMTLS,
+	polKey string,
+	polNamespace string,
+	context string,
+	tls bool,
+	secretRefs map[string]*secrets.SecretReference,
+) *validationResults {
+	res := newValidationResults()
+	if !tls {
+		res.addWarningf("TLS must be enabled in VirtualServer for IngressMTLS policy %s", polKey)
+		res.isError = true
+		return res
+	}
+	if context != specContext {
+		res.addWarningf("IngressMTLS policy %s is not allowed in the %v context", polKey, context)
+		res.isError = true
+		return res
+	}
+	if p.IngressMTLS != nil {
+		res.addWarningf("Multiple ingressMTLS policies are not allowed. IngressMTLS policy %s will be ignored", polKey)
+		return res
+	}
+
+	secretKey := fmt.Sprintf("%v/%v", polNamespace, ingressMTLS.ClientCertSecret)
+	secretRef := secretRefs[secretKey]
+	var secretType api_v1.SecretType
+	if secretRef.Secret != nil {
+		secretType = secretRef.Secret.Type
+	}
+	if secretType != "" && secretType != secrets.SecretTypeCA {
+		res.addWarningf("IngressMTLS policy %s references a secret %s of a wrong type '%s', must be '%s'", polKey, secretKey, secretType, secrets.SecretTypeCA)
+		res.isError = true
+		return res
+	} else if secretRef.Error != nil {
+		res.addWarningf("IngressMTLS policy %q references an invalid secret %s: %v", polKey, secretKey, secretRef.Error)
+		res.isError = true
+		return res
+	}
+
+	verifyDepth := 1
+	verifyClient := "on"
+	if ingressMTLS.VerifyDepth != nil {
+		verifyDepth = *ingressMTLS.VerifyDepth
+	}
+	if ingressMTLS.VerifyClient != "" {
+		verifyClient = ingressMTLS.VerifyClient
+	}
+
+	p.IngressMTLS = &version2.IngressMTLS{
+		ClientCert:   secretRef.Path,
+		VerifyClient: verifyClient,
+		VerifyDepth:  verifyDepth,
+	}
+	return res
+}
+
+func (p *policiesCfg) addEgressMTLSConfig(
+	egressMTLS *conf_v1.EgressMTLS,
+	polKey string,
+	polNamespace string,
+	secretRefs map[string]*secrets.SecretReference,
+) *validationResults {
+	res := newValidationResults()
+	if p.EgressMTLS != nil {
+		res.addWarningf(
+			"Multiple egressMTLS policies in the same context is not valid. EgressMTLS policy %s will be ignored",
+			polKey,
+		)
+		return res
+	}
+
+	var tlsSecretPath string
+
+	if egressMTLS.TLSSecret != "" {
+		egressTLSSecret := fmt.Sprintf("%v/%v", polNamespace, egressMTLS.TLSSecret)
+
+		secretRef := secretRefs[egressTLSSecret]
+		var secretType api_v1.SecretType
+		if secretRef.Secret != nil {
+			secretType = secretRef.Secret.Type
+		}
+		if secretType != "" && secretType != api_v1.SecretTypeTLS {
+			res.addWarningf("EgressMTLS policy %s references a secret %s of a wrong type '%s', must be '%s'", polKey, egressTLSSecret, secretType, api_v1.SecretTypeTLS)
+			res.isError = true
+			return res
+		} else if secretRef.Error != nil {
+			res.addWarningf("EgressMTLS policy %s references an invalid secret %s: %v", polKey, egressTLSSecret, secretRef.Error)
+			res.isError = true
+			return res
+		}
+
+		tlsSecretPath = secretRef.Path
+	}
+
+	var trustedSecretPath string
+
+	if egressMTLS.TrustedCertSecret != "" {
+		trustedCertSecret := fmt.Sprintf("%v/%v", polNamespace, egressMTLS.TrustedCertSecret)
+
+		secretRef := secretRefs[trustedCertSecret]
+		var secretType api_v1.SecretType
+		if secretRef.Secret != nil {
+			secretType = secretRef.Secret.Type
+		}
+		if secretType != "" && secretType != secrets.SecretTypeCA {
+			res.addWarningf("EgressMTLS policy %s references a secret %s of a wrong type '%s', must be '%s'", polKey, trustedCertSecret, secretType, secrets.SecretTypeCA)
+			res.isError = true
+			return res
+		} else if secretRef.Error != nil {
+			res.addWarningf("EgressMTLS policy %s references an invalid secret %s: %v", polKey, trustedCertSecret, secretRef.Error)
+			res.isError = true
+			return res
+		}
+
+		trustedSecretPath = secretRef.Path
+	}
+
+	p.EgressMTLS = &version2.EgressMTLS{
+		Certificate:    tlsSecretPath,
+		CertificateKey: tlsSecretPath,
+		Ciphers:        generateString(egressMTLS.Ciphers, "DEFAULT"),
+		Protocols:      generateString(egressMTLS.Protocols, "TLSv1 TLSv1.1 TLSv1.2"),
+		VerifyServer:   egressMTLS.VerifyServer,
+		VerifyDepth:    generateIntFromPointer(egressMTLS.VerifyDepth, 1),
+		SessionReuse:   generateBool(egressMTLS.SessionReuse, true),
+		ServerName:     egressMTLS.ServerName,
+		TrustedCert:    trustedSecretPath,
+		SSLName:        generateString(egressMTLS.SSLName, "$proxy_host"),
+	}
+	return res
+}
+
+func (p *policiesCfg) addOIDCConfig(
+	oidc *conf_v1.OIDC,
+	polKey string,
+	polNamespace string,
+	secretRefs map[string]*secrets.SecretReference,
+	oidcPolCfg *oidcPolicyCfg,
+) *validationResults {
+	res := newValidationResults()
+	if p.OIDC {
+		res.addWarningf(
+			"Multiple oidc policies in the same context is not valid. OIDC policy %s will be ignored",
+			polKey,
+		)
+		return res
+	}
+
+	if oidcPolCfg.oidc != nil {
+		if oidcPolCfg.key != polKey {
+			res.addWarningf(
+				"Only one oidc policy is allowed in a VirtualServer and its VirtualServerRoutes. Can't use %s. Use %s",
+				polKey,
+				oidcPolCfg.key,
+			)
+			res.isError = true
+			return res
+		}
+	} else {
+		secretKey := fmt.Sprintf("%v/%v", polNamespace, oidc.ClientSecret)
+		secretRef := secretRefs[secretKey]
+
+		var secretType api_v1.SecretType
+		if secretRef.Secret != nil {
+			secretType = secretRef.Secret.Type
+		}
+		if secretType != "" && secretType != secrets.SecretTypeOIDC {
+			res.addWarningf("OIDC policy %s references a secret %s of a wrong type '%s', must be '%s'", polKey, secretKey, secretType, secrets.SecretTypeOIDC)
+			res.isError = true
+			return res
+		} else if secretRef.Error != nil {
+			res.addWarningf("OIDC policy %s references an invalid secret %s: %v", polKey, secretKey, secretRef.Error)
+			res.isError = true
+			return res
+		}
+
+		clientSecret := secretRef.Secret.Data[ClientSecretKey]
+
+		redirectURI := oidc.RedirectURI
+		if redirectURI == "" {
+			redirectURI = "/_codexch"
+		}
+		scope := oidc.Scope
+		if scope == "" {
+			scope = "openid"
+		}
+
+		oidcPolCfg.oidc = &version2.OIDC{
+			AuthEndpoint:  oidc.AuthEndpoint,
+			TokenEndpoint: oidc.TokenEndpoint,
+			JwksURI:       oidc.JWKSURI,
+			ClientID:      oidc.ClientID,
+			ClientSecret:  string(clientSecret),
+			Scope:         scope,
+			RedirectURI:   redirectURI,
+		}
+		oidcPolCfg.key = polKey
+	}
+
+	p.OIDC = true
+
+	return res
+}
+
+func (p *policiesCfg) addWAFConfig(
+	waf *conf_v1.WAF,
+	polKey string,
+	polNamespace string,
+	apResources map[string]string,
+) *validationResults {
+	res := newValidationResults()
+	if p.WAF != nil {
+		res.addWarningf("Multiple WAF policies in the same context is not valid. WAF policy %s will be ignored", polKey)
+		return res
+	}
+
+	if waf.Enable {
+		p.WAF = &version2.WAF{Enable: "on"}
+	} else {
+		p.WAF = &version2.WAF{Enable: "off"}
+	}
+
+	if waf.ApPolicy != "" {
+		apPolKey := waf.ApPolicy
+		hasNamepace := strings.Contains(apPolKey, "/")
+		if !hasNamepace {
+			apPolKey = fmt.Sprintf("%v/%v", polNamespace, apPolKey)
+		}
+
+		if apPolPath, exists := apResources[apPolKey]; exists {
+			p.WAF.ApPolicy = apPolPath
+		} else {
+			res.addWarningf("WAF policy %s references an invalid or non-existing App Protect policy %s", polKey, apPolKey)
+			res.isError = true
+			return res
+		}
+	}
+
+	if waf.SecurityLog != nil {
+		p.WAF.ApSecurityLogEnable = true
+
+		logConfKey := waf.SecurityLog.ApLogConf
+		hasNamepace := strings.Contains(logConfKey, "/")
+		if !hasNamepace {
+			logConfKey = fmt.Sprintf("%v/%v", polNamespace, logConfKey)
+		}
+
+		if logConfPath, ok := apResources[logConfKey]; ok {
+			logDest := generateString(waf.SecurityLog.LogDest, "syslog:server=localhost:514")
+			p.WAF.ApLogConf = fmt.Sprintf("%s %s", logConfPath, logDest)
+		} else {
+			res.addWarningf("WAF policy %s references an invalid or non-existing log config %s", polKey, logConfKey)
+			res.isError = true
+		}
+	}
+
+	return res
+}
+
+func (vsc *virtualServerConfigurator) generatePolicies(
+	ownerDetails policyOwnerDetails,
+	policyRefs []conf_v1.PolicyReference,
+	policies map[string]*conf_v1.Policy,
+	context string,
+	policyOpts policyOptions,
+) policiesCfg {
+	config := newPoliciesConfig()
 
 	for _, p := range policyRefs {
 		polNamespace := p.Namespace
 		if polNamespace == "" {
-			polNamespace = ownerNamespace
+			polNamespace = ownerDetails.ownerNamespace
 		}
 
 		key := fmt.Sprintf("%s/%s", polNamespace, p.Name)
 
 		if pol, exists := policies[key]; exists {
-			if pol.Spec.AccessControl != nil {
-				allow = append(allow, pol.Spec.AccessControl.Allow...)
-				deny = append(deny, pol.Spec.AccessControl.Deny...)
-			} else if pol.Spec.RateLimit != nil {
-				rlZoneName := fmt.Sprintf("pol_rl_%v_%v_%v_%v", polNamespace, p.Name, vsNamespace, vsName)
-				limitReqs = append(limitReqs, generateLimitReq(rlZoneName, pol.Spec.RateLimit))
-				limitReqZones = append(limitReqZones, generateLimitReqZone(rlZoneName, pol.Spec.RateLimit))
-				if len(limitReqs) == 1 {
-					limitReqOptions = generateLimitReqOptions(pol.Spec.RateLimit)
-				} else {
-					curOptions := generateLimitReqOptions(pol.Spec.RateLimit)
-					if curOptions.DryRun != limitReqOptions.DryRun {
-						vsc.addWarningf(owner, "RateLimit policy %q with limit request option dryRun=%v is overridden to dryRun=%v by the first policy reference in this context",
-							key, curOptions.DryRun, limitReqOptions.DryRun)
-					}
-					if curOptions.LogLevel != limitReqOptions.LogLevel {
-						vsc.addWarningf(owner, "RateLimit policy %q with limit request option logLevel=%v is overridden to logLevel=%v by the first policy reference in this context",
-							key, curOptions.LogLevel, limitReqOptions.LogLevel)
-					}
-					if curOptions.RejectCode != limitReqOptions.RejectCode {
-						vsc.addWarningf(owner, "RateLimit policy %q with limit request option rejectCode=%v is overridden to rejectCode=%v by the first policy reference in this context",
-							key, curOptions.RejectCode, limitReqOptions.RejectCode)
-					}
+			var res *validationResults
+			switch {
+			case pol.Spec.AccessControl != nil:
+				res = config.addAccessControlConfig(pol.Spec.AccessControl)
+			case pol.Spec.RateLimit != nil:
+				res = config.addRateLimitConfig(
+					pol.Spec.RateLimit,
+					key,
+					polNamespace,
+					p.Name,
+					ownerDetails.vsNamespace,
+					ownerDetails.vsName,
+				)
+			case pol.Spec.JWTAuth != nil:
+				res = config.addJWTAuthConfig(pol.Spec.JWTAuth, key, polNamespace, policyOpts.secretRefs)
+			case pol.Spec.IngressMTLS != nil:
+				res = config.addIngressMTLSConfig(
+					pol.Spec.IngressMTLS,
+					key,
+					polNamespace,
+					context,
+					policyOpts.tls,
+					policyOpts.secretRefs,
+				)
+			case pol.Spec.EgressMTLS != nil:
+				res = config.addEgressMTLSConfig(pol.Spec.EgressMTLS, key, polNamespace, policyOpts.secretRefs)
+			case pol.Spec.OIDC != nil:
+				res = config.addOIDCConfig(pol.Spec.OIDC, key, polNamespace, policyOpts.secretRefs, vsc.oidcPolCfg)
+			case pol.Spec.WAF != nil:
+				res = config.addWAFConfig(pol.Spec.WAF, key, polNamespace, policyOpts.apResources)
+			default:
+				res = newValidationResults()
+			}
+			vsc.addWarnings(ownerDetails.owner, res.warnings)
+			if res.isError {
+				return policiesCfg{
+					ErrorReturn: &version2.Return{Code: 500},
 				}
-			} else if pol.Spec.JWTAuth != nil {
-				if JWTAuth != nil {
-					vsc.addWarningf(owner, "Multiple jwt policies in the same context is not valid. JWT policy %q will be ignored", key)
-					continue
-				}
-
-				jwtSecretKey := fmt.Sprintf("%v/%v", polNamespace, pol.Spec.JWTAuth.Secret)
-				if _, existsOnFilesystem := jwtKeys[jwtSecretKey]; !existsOnFilesystem {
-					vsc.addWarningf(owner, `JWT policy %q references a JWKSecret %q which does not exist`, key, jwtSecretKey)
-					policyError = true
-					break
-				}
-
-				JWTAuth = &version2.JWTAuth{
-					Secret: jwtKeys[jwtSecretKey],
-					Realm:  pol.Spec.JWTAuth.Realm,
-					Token:  pol.Spec.JWTAuth.Token,
-				}
-			} else if pol.Spec.IngressMTLS != nil {
-				if tlsPemFileName == "" {
-					vsc.addWarningf(owner, `TLS configuration needed for IngressMTLS policy`)
-					policyError = true
-					break
-				}
-				if context != specContext {
-					vsc.addWarningf(owner, `IngressMTLS policy is not allowed in the %v context`, context)
-					policyError = true
-					break
-				}
-				if ingressMTLS != nil {
-					vsc.addWarningf(owner, "Multiple ingressMTLS policies are not allowed. IngressMTLS policy %q will be ignored", key)
-					continue
-				}
-
-				if ingressMTLSPemFileName == "" {
-					vsc.addWarningf(owner, `IngressMTLS policy %q references a Secret which does not exist`, key)
-					policyError = true
-					break
-				}
-
-				verifyDepth := 1
-				verifyClient := "on"
-				if pol.Spec.IngressMTLS.VerifyDepth != nil {
-					verifyDepth = *pol.Spec.IngressMTLS.VerifyDepth
-				}
-				if pol.Spec.IngressMTLS.VerifyClient != "" {
-					verifyClient = pol.Spec.IngressMTLS.VerifyClient
-				}
-
-				ingressMTLS = &version2.IngressMTLS{
-					ClientCert:   ingressMTLSPemFileName,
-					VerifyClient: verifyClient,
-					VerifyDepth:  verifyDepth,
-				}
-
-			} else if pol.Spec.EgressMTLS != nil {
-				if egressMTLS != nil {
-					vsc.addWarningf(owner, "Multiple egressMTLS policies in the same context is not valid. EgressMTLS policy %q will be ignored", key)
-					continue
-				}
-
-				egressTLSSecret := fmt.Sprintf("%v/%v", polNamespace, pol.Spec.EgressMTLS.TLSSecret)
-				TrustedCertSecret := fmt.Sprintf("%v/%v", polNamespace, pol.Spec.EgressMTLS.TrustedCertSecret)
-
-				trustedCAFileName, trustedEsists := egressMTLSSecrets[TrustedCertSecret]
-				if pol.Spec.EgressMTLS.TrustedCertSecret != "" && !trustedEsists {
-					vsc.addWarningf(owner, `EgressMTLS policy %q references a Secret which does not exist`, key)
-					policyError = true
-					break
-				}
-
-				egressMTLSPemFileName, tlsExists := egressMTLSSecrets[egressTLSSecret]
-				if pol.Spec.EgressMTLS.TLSSecret != "" && !tlsExists {
-					vsc.addWarningf(owner, `EgressMTLS policy %q references a Secret which does not exist`, key)
-					policyError = true
-					break
-				}
-
-				egressMTLS = &version2.EgressMTLS{
-					Certificate:    egressMTLSPemFileName,
-					CertificateKey: egressMTLSPemFileName,
-					Ciphers:        generateString(pol.Spec.EgressMTLS.Ciphers, "DEFAULT"),
-					Protocols:      generateString(pol.Spec.EgressMTLS.Protocols, "TLSv1 TLSv1.1 TLSv1.2"),
-					VerifyServer:   pol.Spec.EgressMTLS.VerifyServer,
-					VerifyDepth:    generateIntFromPointer(pol.Spec.EgressMTLS.VerifyDepth, 1),
-					SessionReuse:   generateBool(pol.Spec.EgressMTLS.SessionReuse, true),
-					ServerName:     pol.Spec.EgressMTLS.ServerName,
-					TrustedCert:    trustedCAFileName,
-					SSLName:        generateString(pol.Spec.EgressMTLS.SSLName, "$proxy_host"),
-				}
-
 			}
 		} else {
-			vsc.addWarningf(owner, "Policy %s is missing or invalid", key)
-			policyError = true
-			break
+			vsc.addWarningf(ownerDetails.owner, "Policy %s is missing or invalid", key)
+			return policiesCfg{
+				ErrorReturn: &version2.Return{Code: 500},
+			}
 		}
-	}
-	if policyError {
-		return policiesCfg{
-			ErrorReturn: &version2.Return{Code: 500},
-		}
-	} else if len(allow) > 0 && len(deny) > 0 {
-		vsc.addWarningf(owner, "AccessControl policy (or policies) with deny rules is overridden by policy (or policies) with allow rules")
 	}
 
-	return policiesCfg{
-		Allow:           allow,
-		Deny:            deny,
-		LimitReqOptions: limitReqOptions,
-		LimitReqZones:   limitReqZones,
-		LimitReqs:       limitReqs,
-		JWTAuth:         JWTAuth,
-		IngressMTLS:     ingressMTLS,
-		EgressMTLS:      egressMTLS,
-		ErrorReturn:     policyErrorReturn,
-	}
+	return *config
 }
 
-func generateLimitReq(zoneName string, rateLimitPol *conf_v1alpha1.RateLimit) version2.LimitReq {
+func generateLimitReq(zoneName string, rateLimitPol *conf_v1.RateLimit) version2.LimitReq {
 	var limitReq version2.LimitReq
 
 	limitReq.ZoneName = zoneName
@@ -675,7 +1076,7 @@ func generateLimitReq(zoneName string, rateLimitPol *conf_v1alpha1.RateLimit) ve
 	return limitReq
 }
 
-func generateLimitReqZone(zoneName string, rateLimitPol *conf_v1alpha1.RateLimit) version2.LimitReqZone {
+func generateLimitReqZone(zoneName string, rateLimitPol *conf_v1.RateLimit) version2.LimitReqZone {
 	return version2.LimitReqZone{
 		ZoneName: zoneName,
 		Key:      rateLimitPol.Key,
@@ -684,7 +1085,7 @@ func generateLimitReqZone(zoneName string, rateLimitPol *conf_v1alpha1.RateLimit
 	}
 }
 
-func generateLimitReqOptions(rateLimitPol *conf_v1alpha1.RateLimit) version2.LimitReqOptions {
+func generateLimitReqOptions(rateLimitPol *conf_v1.RateLimit) version2.LimitReqOptions {
 	return version2.LimitReqOptions{
 		DryRun:     generateBool(rateLimitPol.DryRun, false),
 		LogLevel:   generateString(rateLimitPol.LogLevel, "error"),
@@ -713,6 +1114,8 @@ func addPoliciesCfgToLocation(cfg policiesCfg, location *version2.Location) {
 	location.LimitReqs = cfg.LimitReqs
 	location.JWTAuth = cfg.JWTAuth
 	location.EgressMTLS = cfg.EgressMTLS
+	location.OIDC = cfg.OIDC
+	location.WAF = cfg.WAF
 	location.PoliciesErrorReturn = cfg.ErrorReturn
 }
 
@@ -743,7 +1146,13 @@ func getUpstreamResourceLabels(owner runtime.Object) version2.UpstreamLabels {
 	}
 }
 
-func (vsc *virtualServerConfigurator) generateUpstream(owner runtime.Object, upstreamName string, upstream conf_v1.Upstream, isExternalNameSvc bool, endpoints []string) version2.Upstream {
+func (vsc *virtualServerConfigurator) generateUpstream(
+	owner runtime.Object,
+	upstreamName string,
+	upstream conf_v1.Upstream,
+	isExternalNameSvc bool,
+	endpoints []string,
+) version2.Upstream {
 	var upsServers []version2.UpstreamServer
 	for _, e := range endpoints {
 		s := version2.UpstreamServer{
@@ -765,7 +1174,7 @@ func (vsc *virtualServerConfigurator) generateUpstream(owner runtime.Object, ups
 		LBMethod:         lbMethod,
 		Keepalive:        generateIntFromPointer(upstream.Keepalive, vsc.cfgParams.Keepalive),
 		MaxFails:         generateIntFromPointer(upstream.MaxFails, vsc.cfgParams.MaxFails),
-		FailTimeout:      generateString(upstream.FailTimeout, vsc.cfgParams.FailTimeout),
+		FailTimeout:      generateTimeWithDefault(upstream.FailTimeout, vsc.cfgParams.FailTimeout),
 		MaxConns:         generateIntFromPointer(upstream.MaxConns, vsc.cfgParams.MaxConns),
 		UpstreamZoneSize: vsc.cfgParams.UpstreamZoneSize,
 	}
@@ -779,7 +1188,11 @@ func (vsc *virtualServerConfigurator) generateUpstream(owner runtime.Object, ups
 	return ups
 }
 
-func (vsc *virtualServerConfigurator) generateSlowStartForPlus(owner runtime.Object, upstream conf_v1.Upstream, lbMethod string) string {
+func (vsc *virtualServerConfigurator) generateSlowStartForPlus(
+	owner runtime.Object,
+	upstream conf_v1.Upstream,
+	lbMethod string,
+) string {
 	if upstream.SlowStart == "" {
 		return ""
 	}
@@ -792,10 +1205,14 @@ func (vsc *virtualServerConfigurator) generateSlowStartForPlus(owner runtime.Obj
 		return ""
 	}
 
-	return upstream.SlowStart
+	return generateTime(upstream.SlowStart)
 }
 
-func generateHealthCheck(upstream conf_v1.Upstream, upstreamName string, cfgParams *ConfigParams) *version2.HealthCheck {
+func generateHealthCheck(
+	upstream conf_v1.Upstream,
+	upstreamName string,
+	cfgParams *ConfigParams,
+) *version2.HealthCheck {
 	if upstream.HealthCheck == nil || !upstream.HealthCheck.Enable {
 		return nil
 	}
@@ -807,11 +1224,11 @@ func generateHealthCheck(upstream conf_v1.Upstream, upstreamName string, cfgPara
 	}
 
 	if upstream.HealthCheck.Interval != "" {
-		hc.Interval = upstream.HealthCheck.Interval
+		hc.Interval = generateTime(upstream.HealthCheck.Interval)
 	}
 
 	if upstream.HealthCheck.Jitter != "" {
-		hc.Jitter = upstream.HealthCheck.Jitter
+		hc.Jitter = generateTime(upstream.HealthCheck.Jitter)
 	}
 
 	if upstream.HealthCheck.Fails > 0 {
@@ -827,15 +1244,15 @@ func generateHealthCheck(upstream conf_v1.Upstream, upstreamName string, cfgPara
 	}
 
 	if upstream.HealthCheck.ConnectTimeout != "" {
-		hc.ProxyConnectTimeout = upstream.HealthCheck.ConnectTimeout
+		hc.ProxyConnectTimeout = generateTime(upstream.HealthCheck.ConnectTimeout)
 	}
 
 	if upstream.HealthCheck.ReadTimeout != "" {
-		hc.ProxyReadTimeout = upstream.HealthCheck.ReadTimeout
+		hc.ProxyReadTimeout = generateTime(upstream.HealthCheck.ReadTimeout)
 	}
 
 	if upstream.HealthCheck.SendTimeout != "" {
-		hc.ProxySendTimeout = upstream.HealthCheck.SendTimeout
+		hc.ProxySendTimeout = generateTime(upstream.HealthCheck.SendTimeout)
 	}
 
 	for _, h := range upstream.HealthCheck.Headers {
@@ -977,11 +1394,27 @@ func generateString(s string, defaultS string) string {
 	return s
 }
 
-func generateSnippets(enableSnippets bool, s string, defaultS []string) []string {
-	if !enableSnippets || s == "" {
-		return defaultS
+func generateTime(value string) string {
+	// it is expected that the value has been validated prior to call generateTime
+	parsed, _ := ParseTime(value)
+	return parsed
+}
+
+func generateTimeWithDefault(value string, defaultValue string) string {
+	if value == "" {
+		// we don't transform the default value yet
+		// this is done for backward compatibility, as the time values in the ConfigMap are not validated yet
+		return defaultValue
 	}
-	return strings.Split(s, "\n")
+
+	return generateTime(value)
+}
+
+func generateSnippets(enableSnippets bool, snippet string, defaultSnippets []string) []string {
+	if !enableSnippets || snippet == "" {
+		return defaultSnippets
+	}
+	return strings.Split(snippet, "\n")
 }
 
 func generateBuffers(s *conf_v1.UpstreamBuffers, defaultS string) string {
@@ -1025,8 +1458,7 @@ func generateReturnBlock(text string, code int, defaultCode int) *version2.Retur
 
 func generateLocation(path string, upstreamName string, upstream conf_v1.Upstream, action *conf_v1.Action,
 	cfgParams *ConfigParams, errorPages []conf_v1.ErrorPage, internal bool, errPageIndex int, proxySSLName string,
-	originalPath string, locSnippets string, enableSnippets bool, retLocIndex int) (version2.Location, *version2.ReturnLocation) {
-
+	originalPath string, locSnippets string, enableSnippets bool, retLocIndex int, isVSR bool, vsrName string, vsrNamespace string) (version2.Location, *version2.ReturnLocation) {
 	locationSnippets := generateSnippets(enableSnippets, locSnippets, cfgParams.LocationSnippets)
 
 	if action.Redirect != nil {
@@ -1037,20 +1469,30 @@ func generateLocation(path string, upstreamName string, upstream conf_v1.Upstrea
 		return generateLocationForReturn(path, cfgParams.LocationSnippets, action.Return, retLocIndex)
 	}
 
-	return generateLocationForProxying(path, upstreamName, upstream, cfgParams, errorPages, internal, errPageIndex, proxySSLName, action.Proxy, originalPath, locationSnippets), nil
+	return generateLocationForProxying(path, upstreamName, upstream, cfgParams, errorPages, internal,
+		errPageIndex, proxySSLName, action.Proxy, originalPath, locationSnippets, isVSR, vsrName, vsrNamespace), nil
 }
 
 func generateProxySetHeaders(proxy *conf_v1.ActionProxy) []version2.Header {
-	if proxy == nil || proxy.RequestHeaders == nil {
-		return nil
+	var headers []version2.Header
+
+	hasHostHeader := false
+
+	if proxy != nil && proxy.RequestHeaders != nil {
+		for _, h := range proxy.RequestHeaders.Set {
+			headers = append(headers, version2.Header{
+				Name:  h.Name,
+				Value: h.Value,
+			})
+
+			if strings.ToLower(h.Name) == "host" {
+				hasHostHeader = true
+			}
+		}
 	}
 
-	var headers []version2.Header
-	for _, h := range proxy.RequestHeaders.Set {
-		headers = append(headers, version2.Header{
-			Name:  h.Name,
-			Value: h.Value,
-		})
+	if !hasHostHeader {
+		headers = append(headers, version2.Header{Name: "Host", Value: "$host"})
 	}
 
 	return headers
@@ -1113,14 +1555,14 @@ func generateProxyAddHeaders(proxy *conf_v1.ActionProxy) []version2.AddHeader {
 
 func generateLocationForProxying(path string, upstreamName string, upstream conf_v1.Upstream,
 	cfgParams *ConfigParams, errorPages []conf_v1.ErrorPage, internal bool, errPageIndex int,
-	proxySSLName string, proxy *conf_v1.ActionProxy, originalPath string, locationSnippets []string) version2.Location {
+	proxySSLName string, proxy *conf_v1.ActionProxy, originalPath string, locationSnippets []string, isVSR bool, vsrName string, vsrNamespace string) version2.Location {
 	return version2.Location{
 		Path:                     generatePath(path),
 		Internal:                 internal,
 		Snippets:                 locationSnippets,
-		ProxyConnectTimeout:      generateString(upstream.ProxyConnectTimeout, cfgParams.ProxyConnectTimeout),
-		ProxyReadTimeout:         generateString(upstream.ProxyReadTimeout, cfgParams.ProxyReadTimeout),
-		ProxySendTimeout:         generateString(upstream.ProxySendTimeout, cfgParams.ProxySendTimeout),
+		ProxyConnectTimeout:      generateTimeWithDefault(upstream.ProxyConnectTimeout, cfgParams.ProxyConnectTimeout),
+		ProxyReadTimeout:         generateTimeWithDefault(upstream.ProxyReadTimeout, cfgParams.ProxyReadTimeout),
+		ProxySendTimeout:         generateTimeWithDefault(upstream.ProxySendTimeout, cfgParams.ProxySendTimeout),
 		ClientMaxBodySize:        generateString(upstream.ClientMaxBodySize, cfgParams.ClientMaxBodySize),
 		ProxyMaxTempFileSize:     cfgParams.ProxyMaxTempFileSize,
 		ProxyBuffering:           generateBool(upstream.ProxyBuffering, cfgParams.ProxyBuffering),
@@ -1128,7 +1570,7 @@ func generateLocationForProxying(path string, upstreamName string, upstream conf
 		ProxyBufferSize:          generateString(upstream.ProxyBufferSize, cfgParams.ProxyBufferSize),
 		ProxyPass:                generateProxyPass(upstream.TLS.Enable, upstreamName, internal, proxy),
 		ProxyNextUpstream:        generateString(upstream.ProxyNextUpstream, "error timeout"),
-		ProxyNextUpstreamTimeout: generateString(upstream.ProxyNextUpstreamTimeout, "0s"),
+		ProxyNextUpstreamTimeout: generateTimeWithDefault(upstream.ProxyNextUpstreamTimeout, "0s"),
 		ProxyNextUpstreamTries:   upstream.ProxyNextUpstreamTries,
 		ProxyInterceptErrors:     generateProxyInterceptErrors(errorPages),
 		ProxyPassRequestHeaders:  generateProxyPassRequestHeaders(proxy),
@@ -1142,6 +1584,10 @@ func generateLocationForProxying(path string, upstreamName string, upstream conf
 		HasKeepalive:             upstreamHasKeepalive(upstream, cfgParams),
 		ErrorPages:               generateErrorPages(errPageIndex, errorPages),
 		ProxySSLName:             proxySSLName,
+		ServiceName:              upstream.Service,
+		IsVSR:                    isVSR,
+		VSRName:                  vsrName,
+		VSRNamespace:             vsrNamespace,
 	}
 }
 
@@ -1149,7 +1595,11 @@ func generateProxyInterceptErrors(errorPages []conf_v1.ErrorPage) bool {
 	return len(errorPages) > 0
 }
 
-func generateLocationForRedirect(path string, locationSnippets []string, redirect *conf_v1.ActionRedirect) version2.Location {
+func generateLocationForRedirect(
+	path string,
+	locationSnippets []string,
+	redirect *conf_v1.ActionRedirect,
+) version2.Location {
 	code := redirect.Code
 	if code == 0 {
 		code = 301
@@ -1213,11 +1663,23 @@ type routingCfg struct {
 	ReturnLocations          []version2.ReturnLocation
 }
 
-func generateSplits(splits []conf_v1.Split, upstreamNamer *upstreamNamer, crUpstreams map[string]conf_v1.Upstream,
-	variableNamer *variableNamer, scIndex int, cfgParams *ConfigParams, errorPages []conf_v1.ErrorPage, errPageIndex int,
-	originalPath string, locSnippets string, enableSnippets bool,
-	retLocIndex int) (version2.SplitClient, []version2.Location, []version2.ReturnLocation) {
-
+func generateSplits(
+	splits []conf_v1.Split,
+	upstreamNamer *upstreamNamer,
+	crUpstreams map[string]conf_v1.Upstream,
+	variableNamer *variableNamer,
+	scIndex int,
+	cfgParams *ConfigParams,
+	errorPages []conf_v1.ErrorPage,
+	errPageIndex int,
+	originalPath string,
+	locSnippets string,
+	enableSnippets bool,
+	retLocIndex int,
+	isVSR bool,
+	vsrName string,
+	vsrNamespace string,
+) (version2.SplitClient, []version2.Location, []version2.ReturnLocation) {
 	var distributions []version2.Distribution
 
 	for i, s := range splits {
@@ -1244,7 +1706,7 @@ func generateSplits(splits []conf_v1.Split, upstreamNamer *upstreamNamer, crUpst
 		proxySSLName := generateProxySSLName(upstream.Service, upstreamNamer.namespace)
 		newRetLocIndex := retLocIndex + len(returnLocations)
 		loc, returnLoc := generateLocation(path, upstreamName, upstream, s.Action, cfgParams, errorPages, true,
-			errPageIndex, proxySSLName, originalPath, locSnippets, enableSnippets, newRetLocIndex)
+			errPageIndex, proxySSLName, originalPath, locSnippets, enableSnippets, newRetLocIndex, isVSR, vsrName, vsrNamespace)
 		locations = append(locations, loc)
 		if returnLoc != nil {
 			returnLocations = append(returnLocations, *returnLoc)
@@ -1254,12 +1716,25 @@ func generateSplits(splits []conf_v1.Split, upstreamNamer *upstreamNamer, crUpst
 	return splitClient, locations, returnLocations
 }
 
-func generateDefaultSplitsConfig(route conf_v1.Route, upstreamNamer *upstreamNamer, crUpstreams map[string]conf_v1.Upstream,
-	variableNamer *variableNamer, scIndex int, cfgParams *ConfigParams, errorPages []conf_v1.ErrorPage, errPageIndex int,
-	originalPath string, locSnippets string, enableSnippets bool, retLocIndex int) routingCfg {
-
+func generateDefaultSplitsConfig(
+	route conf_v1.Route,
+	upstreamNamer *upstreamNamer,
+	crUpstreams map[string]conf_v1.Upstream,
+	variableNamer *variableNamer,
+	scIndex int,
+	cfgParams *ConfigParams,
+	errorPages []conf_v1.ErrorPage,
+	errPageIndex int,
+	originalPath string,
+	locSnippets string,
+	enableSnippets bool,
+	retLocIndex int,
+	isVSR bool,
+	vsrName string,
+	vsrNamespace string,
+) routingCfg {
 	sc, locs, returnLocs := generateSplits(route.Splits, upstreamNamer, crUpstreams, variableNamer, scIndex, cfgParams,
-		errorPages, errPageIndex, originalPath, locSnippets, enableSnippets, retLocIndex)
+		errorPages, errPageIndex, originalPath, locSnippets, enableSnippets, retLocIndex, isVSR, vsrName, vsrNamespace)
 
 	splitClientVarName := variableNamer.GetNameForSplitClientVariable(scIndex)
 
@@ -1278,7 +1753,7 @@ func generateDefaultSplitsConfig(route conf_v1.Route, upstreamNamer *upstreamNam
 
 func generateMatchesConfig(route conf_v1.Route, upstreamNamer *upstreamNamer, crUpstreams map[string]conf_v1.Upstream,
 	variableNamer *variableNamer, index int, scIndex int, cfgParams *ConfigParams, errorPages []conf_v1.ErrorPage,
-	errPageIndex int, locSnippets string, enableSnippets bool, retLocIndex int) routingCfg {
+	errPageIndex int, locSnippets string, enableSnippets bool, retLocIndex int, isVSR bool, vsrName string, vsrNamespace string) routingCfg {
 	// Generate maps
 	var maps []version2.Map
 
@@ -1353,8 +1828,23 @@ func generateMatchesConfig(route conf_v1.Route, upstreamNamer *upstreamNamer, cr
 	for i, m := range route.Matches {
 		if len(m.Splits) > 0 {
 			newRetLocIndex := retLocIndex + len(returnLocations)
-			sc, locs, returnLocs := generateSplits(m.Splits, upstreamNamer, crUpstreams, variableNamer, scIndex+scLocalIndex,
-				cfgParams, errorPages, errPageIndex, route.Path, locSnippets, enableSnippets, newRetLocIndex)
+			sc, locs, returnLocs := generateSplits(
+				m.Splits,
+				upstreamNamer,
+				crUpstreams,
+				variableNamer,
+				scIndex+scLocalIndex,
+				cfgParams,
+				errorPages,
+				errPageIndex,
+				route.Path,
+				locSnippets,
+				enableSnippets,
+				newRetLocIndex,
+				isVSR,
+				vsrName,
+				vsrNamespace,
+			)
 			scLocalIndex++
 			splitClients = append(splitClients, sc)
 			locations = append(locations, locs...)
@@ -1366,7 +1856,7 @@ func generateMatchesConfig(route conf_v1.Route, upstreamNamer *upstreamNamer, cr
 			proxySSLName := generateProxySSLName(upstream.Service, upstreamNamer.namespace)
 			newRetLocIndex := retLocIndex + len(returnLocations)
 			loc, returnLoc := generateLocation(path, upstreamName, upstream, m.Action, cfgParams, errorPages, true,
-				errPageIndex, proxySSLName, route.Path, locSnippets, enableSnippets, newRetLocIndex)
+				errPageIndex, proxySSLName, route.Path, locSnippets, enableSnippets, newRetLocIndex, isVSR, vsrName, vsrNamespace)
 			locations = append(locations, loc)
 			if returnLoc != nil {
 				returnLocations = append(returnLocations, *returnLoc)
@@ -1377,8 +1867,23 @@ func generateMatchesConfig(route conf_v1.Route, upstreamNamer *upstreamNamer, cr
 	// Generate default splits or default action
 	if len(route.Splits) > 0 {
 		newRetLocIndex := retLocIndex + len(returnLocations)
-		sc, locs, returnLocs := generateSplits(route.Splits, upstreamNamer, crUpstreams, variableNamer, scIndex+scLocalIndex,
-			cfgParams, errorPages, errPageIndex, route.Path, locSnippets, enableSnippets, newRetLocIndex)
+		sc, locs, returnLocs := generateSplits(
+			route.Splits,
+			upstreamNamer,
+			crUpstreams,
+			variableNamer,
+			scIndex+scLocalIndex,
+			cfgParams,
+			errorPages,
+			errPageIndex,
+			route.Path,
+			locSnippets,
+			enableSnippets,
+			newRetLocIndex,
+			isVSR,
+			vsrName,
+			vsrNamespace,
+		)
 		splitClients = append(splitClients, sc)
 		locations = append(locations, locs...)
 		returnLocations = append(returnLocations, returnLocs...)
@@ -1389,7 +1894,7 @@ func generateMatchesConfig(route conf_v1.Route, upstreamNamer *upstreamNamer, cr
 		proxySSLName := generateProxySSLName(upstream.Service, upstreamNamer.namespace)
 		newRetLocIndex := retLocIndex + len(returnLocations)
 		loc, returnLoc := generateLocation(path, upstreamName, upstream, route.Action, cfgParams, errorPages, true,
-			errPageIndex, proxySSLName, route.Path, locSnippets, enableSnippets, newRetLocIndex)
+			errPageIndex, proxySSLName, route.Path, locSnippets, enableSnippets, newRetLocIndex, isVSR, vsrName, vsrNamespace)
 		locations = append(locations, loc)
 		if returnLoc != nil {
 			returnLocations = append(returnLocations, *returnLoc)
@@ -1475,7 +1980,8 @@ func getNameForSourceForMatchesRouteMapFromCondition(condition conf_v1.Condition
 	return condition.Variable
 }
 
-func generateSSLConfig(tls *conf_v1.TLS, tlsPemFileName string, cfgParams *ConfigParams) *version2.SSL {
+func (vsc *virtualServerConfigurator) generateSSLConfig(owner runtime.Object, tls *conf_v1.TLS, namespace string,
+	secretRefs map[string]*secrets.SecretReference, cfgParams *ConfigParams) *version2.SSL {
 	if tls == nil {
 		return nil
 	}
@@ -1484,21 +1990,28 @@ func generateSSLConfig(tls *conf_v1.TLS, tlsPemFileName string, cfgParams *Confi
 		return nil
 	}
 
+	secretRef := secretRefs[fmt.Sprintf("%s/%s", namespace, tls.Secret)]
+	var secretType api_v1.SecretType
+	if secretRef.Secret != nil {
+		secretType = secretRef.Secret.Type
+	}
 	var name string
-	var ciphers string
-
-	if tlsPemFileName != "" {
-		name = tlsPemFileName
+	var rejectHandshake bool
+	if secretType != "" && secretType != api_v1.SecretTypeTLS {
+		rejectHandshake = true
+		vsc.addWarningf(owner, "TLS secret %s is of a wrong type '%s', must be '%s'", tls.Secret, secretType, api_v1.SecretTypeTLS)
+	} else if secretRef.Error != nil {
+		rejectHandshake = true
+		vsc.addWarningf(owner, "TLS secret %s is invalid: %v", tls.Secret, secretRef.Error)
 	} else {
-		name = pemFileNameForMissingTLSSecret
-		ciphers = "NULL"
+		name = secretRef.Path
 	}
 
 	ssl := version2.SSL{
-		HTTP2:          cfgParams.HTTP2,
-		Certificate:    name,
-		CertificateKey: name,
-		Ciphers:        ciphers,
+		HTTP2:           cfgParams.HTTP2,
+		Certificate:     name,
+		CertificateKey:  name,
+		RejectHandshake: rejectHandshake,
 	}
 
 	return &ssl
@@ -1534,7 +2047,11 @@ func createEndpointsFromUpstream(upstream version2.Upstream) []string {
 	return endpoints
 }
 
-func createUpstreamsForPlus(virtualServerEx *VirtualServerEx, baseCfgParams *ConfigParams, staticParams *StaticConfigParams) []version2.Upstream {
+func createUpstreamsForPlus(
+	virtualServerEx *VirtualServerEx,
+	baseCfgParams *ConfigParams,
+	staticParams *StaticConfigParams,
+) []version2.Upstream {
 	var upstreams []version2.Upstream
 
 	isPlus := true
@@ -1563,7 +2080,12 @@ func createUpstreamsForPlus(virtualServerEx *VirtualServerEx, baseCfgParams *Con
 		for _, u := range vsr.Spec.Upstreams {
 			isExternalNameSvc := virtualServerEx.ExternalNameSvcs[GenerateExternalNameSvcKey(vsr.Namespace, u.Service)]
 			if isExternalNameSvc {
-				glog.V(3).Infof("Service %s is Type ExternalName, skipping NGINX Plus endpoints update via API", u.Service)
+				glog.V(
+					3,
+				).Infof(
+					"Service %s is Type ExternalName, skipping NGINX Plus endpoints update via API",
+					u.Service,
+				)
 				continue
 			}
 
@@ -1600,7 +2122,7 @@ func generateQueueForPlus(upstreamQueue *conf_v1.UpstreamQueue, defaultTimeout s
 
 	return &version2.Queue{
 		Size:    upstreamQueue.Size,
-		Timeout: generateString(upstreamQueue.Timeout, defaultTimeout),
+		Timeout: generateTimeWithDefault(upstreamQueue.Timeout, defaultTimeout),
 	}
 }
 

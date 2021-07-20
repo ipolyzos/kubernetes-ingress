@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/golang/glog"
+	"github.com/nginxinc/kubernetes-ingress/internal/k8s/appprotect"
 	conf_v1 "github.com/nginxinc/kubernetes-ingress/pkg/apis/configuration/v1"
 	conf_v1alpha1 "github.com/nginxinc/kubernetes-ingress/pkg/apis/configuration/v1alpha1"
 	v1 "k8s.io/api/core/v1"
@@ -29,7 +30,7 @@ type taskQueue struct {
 // The sync function is called for every element inserted into the queue.
 func newTaskQueue(syncFn func(task)) *taskQueue {
 	return &taskQueue{
-		queue:      workqueue.New(),
+		queue:      workqueue.NewNamed("taskQueue"),
 		sync:       syncFn,
 		workerDone: make(chan struct{}),
 	}
@@ -55,7 +56,6 @@ func (tq *taskQueue) Enqueue(obj interface{}) {
 	}
 
 	glog.V(3).Infof("Adding an element with a key: %v", task.Key)
-
 	tq.queue.Add(task)
 }
 
@@ -103,31 +103,22 @@ func (tq *taskQueue) Shutdown() {
 // kind represents the kind of the Kubernetes resources of a task
 type kind int
 
+// resources
 const (
-	// ingress resource
 	ingress = iota
-	// endpoints resource
 	endpoints
-	// configMap resource
 	configMap
-	// secret resource
 	secret
-	// service resource
 	service
-	// virtualserver resource
 	virtualserver
-	// virtualServeRoute resource
 	virtualServerRoute
-	// globalConfiguration resource
 	globalConfiguration
-	// transportserver resource
 	transportserver
-	// policy resource
 	policy
-	// appProtectPolicy resource
 	appProtectPolicy
-	// appProtectlogconf resource
 	appProtectLogConf
+	appProtectUserSig
+	ingressLink
 )
 
 // task is an element of a taskQueue
@@ -154,19 +145,23 @@ func newTask(key string, obj interface{}) (task, error) {
 		k = virtualserver
 	case *conf_v1.VirtualServerRoute:
 		k = virtualServerRoute
+	case *conf_v1.Policy:
+		k = policy
 	case *conf_v1alpha1.GlobalConfiguration:
 		k = globalConfiguration
 	case *conf_v1alpha1.TransportServer:
 		k = transportserver
-	case *conf_v1alpha1.Policy:
-		k = policy
 	case *unstructured.Unstructured:
-		if objectKind := obj.(*unstructured.Unstructured).GetKind(); objectKind == appProtectPolicyGVK.Kind {
+		if objectKind := obj.(*unstructured.Unstructured).GetKind(); objectKind == appprotect.PolicyGVK.Kind {
 			k = appProtectPolicy
-		} else if objectKind == appProtectLogConfGVK.Kind {
+		} else if objectKind == appprotect.LogConfGVK.Kind {
 			k = appProtectLogConf
+		} else if objectKind == ingressLinkGVK.Kind {
+			k = ingressLink
+		} else if objectKind == appprotect.UserSigGVK.Kind {
+			k = appProtectUserSig
 		} else {
-			return task{}, fmt.Errorf("Unknow unstructured kind: %v", objectKind)
+			return task{}, fmt.Errorf("Unknown unstructured kind: %v", objectKind)
 		}
 	default:
 		return task{}, fmt.Errorf("Unknown type: %v", t)

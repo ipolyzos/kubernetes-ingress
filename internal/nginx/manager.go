@@ -2,6 +2,7 @@ package nginx
 
 import (
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -15,26 +16,28 @@ import (
 	"github.com/nginxinc/nginx-plus-go-client/client"
 )
 
-// ReloadForEndpointsUpdate means that is caused by an endpoints update.
-const ReloadForEndpointsUpdate = true
+const (
+	ReloadForEndpointsUpdate     = true  // ReloadForEndpointsUpdate means that is caused by an endpoints update.
+	ReloadForOtherUpdate         = false // ReloadForOtherUpdate means that a reload is caused by an update for a resource(s) other than endpoints.
+	TLSSecretFileMode            = 0o600 // TLSSecretFileMode defines the default filemode for files with TLS Secrets.
+	JWKSecretFileMode            = 0o644 // JWKSecretFileMode defines the default filemode for files with JWK Secrets.
+	configFileMode               = 0o644
+	jsonFileForOpenTracingTracer = "/var/lib/nginx/tracer-config.json"
+	nginxBinaryPath              = "/usr/sbin/nginx"
+	nginxBinaryPathDebug         = "/usr/sbin/nginx-debug"
 
-// ReloadForOtherUpdate means that a reload is caused by an update for a resource(s) other than endpoints.
-const ReloadForOtherUpdate = false
+	appProtectPluginStartCmd = "/usr/share/ts/bin/bd-socket-plugin"
+	appProtectAgentStartCmd  = "/opt/app_protect/bin/bd_agent"
 
-// TLSSecretFileMode defines the default filemode for files with TLS Secrets.
-const TLSSecretFileMode = 0600
+	// appPluginParams is the configuration of App-Protect plugin
+	appPluginParams = "tmm_count 4 proc_cpuinfo_cpu_mhz 2000000 total_xml_memory 307200000 total_umu_max_size 3129344 sys_max_account_id 1024 no_static_config"
 
-// JWKSecretFileMode defines the default filemode for files with JWK Secrets.
-const JWKSecretFileMode = 0644
+	// appProtectDebugLogConfigFileContent holds the content of the file to be written when nginx debug is enabled. It will enable NGINX App Protect debug logs
+	appProtectDebugLogConfigFileContent = "MODULE = IO_PLUGIN;\nLOG_LEVEL = TS_INFO | TS_DEBUG;\nFILE = 2;\nMODULE = ECARD_POLICY;\nLOG_LEVEL = TS_INFO | TS_DEBUG;\nFILE = 2;\n"
 
-const configFileMode = 0644
-const jsonFileForOpenTracingTracer = "/var/lib/nginx/tracer-config.json"
-
-// appPluginParams is the configuration of App-Protect plugin
-const appPluginParams = "tmm_count 4 proc_cpuinfo_cpu_mhz 2000000 total_xml_memory 307200000 total_umu_max_size 3129344 sys_max_account_id 1024 no_static_config"
-
-const appProtectPluginStartCmd = "/usr/share/ts/bin/bd-socket-plugin"
-const appProtectAgentStartCmd = "/opt/app_protect/bin/bd_agent"
+	// appProtectLogConfigFileName is the location of the NGINX App Protect logging configuration file
+	appProtectLogConfigFileName = "/etc/app_protect/bd/logger.cfg"
+)
 
 // ServerConfig holds the config data for an upstream server in NGINX Plus.
 type ServerConfig struct {
@@ -43,12 +46,6 @@ type ServerConfig struct {
 	FailTimeout string
 	SlowStart   string
 }
-
-// appProtectDebugLogConfigFileContent holds the content of the file to be written when nginx debug is enabled. It will enable NGINX App Protect debug logs
-const appProtectDebugLogConfigFileContent = "MODULE = IO_PLUGIN;\nLOG_LEVEL = TS_INFO | TS_DEBUG;\nFILE = 2;\nMODULE = ECARD_POLICY;\nLOG_LEVEL = TS_INFO | TS_DEBUG;\nFILE = 2;\n"
-
-// appProtectLogConfigFileName is the location of the NGINX App Protect logging configuration file
-const appProtectLogConfigFileName = "/etc/app_protect/bd/logger.cfg"
 
 // The Manager interface updates NGINX configuration, starts, reloads and quits NGINX,
 // updates NGINX Plus upstream servers.
@@ -63,10 +60,12 @@ type Manager interface {
 	DeleteSecret(name string)
 	CreateAppProtectResourceFile(name string, content []byte)
 	DeleteAppProtectResourceFile(name string)
+	ClearAppProtectFolder(name string)
 	GetFilenameForSecret(name string) string
 	CreateDHParam(content string) (string, error)
 	CreateOpenTracingTracerConfig(content string) error
 	Start(done chan error)
+	Version() string
 	Reload(isEndpointsUpdate bool) error
 	Quit()
 	UpdateConfigVersionFile(openTracing bool)
@@ -88,14 +87,12 @@ type LocalManager struct {
 	secretsPath                  string
 	mainConfFilename             string
 	configVersionFilename        string
-	binaryFilename               string
+	debug                        bool
 	dhparamFilename              string
 	tlsPassthroughHostsFilename  string
 	verifyConfigGenerator        *verifyConfigGenerator
 	verifyClient                 *verifyClient
 	configVersion                int
-	reloadCmd                    string
-	quitCmd                      string
 	plusClient                   *client.NginxClient
 	plusConfigVersionCheckClient *http.Client
 	metricsCollector             collectors.ManagerCollector
@@ -105,7 +102,7 @@ type LocalManager struct {
 }
 
 // NewLocalManager creates a LocalManager.
-func NewLocalManager(confPath string, binaryFilename string, mc collectors.ManagerCollector, timeout int) *LocalManager {
+func NewLocalManager(confPath string, debug bool, mc collectors.ManagerCollector, timeout time.Duration) *LocalManager {
 	verifyConfigGenerator, err := newVerifyConfigGenerator()
 	if err != nil {
 		glog.Fatalf("error instantiating a verifyConfigGenerator: %v", err)
@@ -119,12 +116,10 @@ func NewLocalManager(confPath string, binaryFilename string, mc collectors.Manag
 		mainConfFilename:            path.Join(confPath, "nginx.conf"),
 		configVersionFilename:       path.Join(confPath, "config-version.conf"),
 		tlsPassthroughHostsFilename: path.Join(confPath, "tls-passthrough-hosts.conf"),
-		binaryFilename:              binaryFilename,
+		debug:                       debug,
 		verifyConfigGenerator:       verifyConfigGenerator,
 		configVersion:               0,
 		verifyClient:                newVerifyClient(timeout),
-		reloadCmd:                   fmt.Sprintf("%v -s %v", binaryFilename, "reload"),
-		quitCmd:                     fmt.Sprintf("%v -s %v", binaryFilename, "quit"),
 		metricsCollector:            mc,
 	}
 
@@ -231,7 +226,7 @@ func (lm *LocalManager) CreateDHParam(content string) (string, error) {
 
 	err := createFileAndWrite(lm.dhparamFilename, []byte(content))
 	if err != nil {
-		return lm.dhparamFilename, fmt.Errorf("Failed to write dhparam file from %v: %v", lm.dhparamFilename, err)
+		return lm.dhparamFilename, fmt.Errorf("Failed to write dhparam file from %v: %w", lm.dhparamFilename, err)
 	}
 
 	return lm.dhparamFilename, nil
@@ -248,8 +243,22 @@ func (lm *LocalManager) CreateAppProtectResourceFile(name string, content []byte
 
 // DeleteAppProtectResourceFile removes an App Protect resource file from storage
 func (lm *LocalManager) DeleteAppProtectResourceFile(name string) {
-	if err := os.Remove(name); err != nil {
-		glog.Warningf("Failed to delete App Protect Resource from %v: %v", name, err)
+	// This check is done to avoid errors in case eg. a policy is referenced, but it never became valid.
+	if _, err := os.Stat(name); !os.IsNotExist(err) {
+		if err := os.Remove(name); err != nil {
+			glog.Fatalf("Failed to delete App Protect Resource from %v: %v", name, err)
+		}
+	}
+}
+
+// ClearAppProtectFolder clears contents of a config folder
+func (lm *LocalManager) ClearAppProtectFolder(name string) {
+	files, err := ioutil.ReadDir(name)
+	if err != nil {
+		glog.Fatalf("Failed to read the App Protect folder %s: %v", name, err)
+	}
+	for _, file := range files {
+		lm.DeleteAppProtectResourceFile(fmt.Sprintf("%s/%s", name, file.Name()))
 	}
 }
 
@@ -257,7 +266,8 @@ func (lm *LocalManager) DeleteAppProtectResourceFile(name string) {
 func (lm *LocalManager) Start(done chan error) {
 	glog.V(3).Info("Starting nginx")
 
-	cmd := exec.Command(lm.binaryFilename)
+	binaryFilename := getBinaryFileName(lm.debug)
+	cmd := exec.Command(binaryFilename)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -283,14 +293,15 @@ func (lm *LocalManager) Reload(isEndpointsUpdate bool) error {
 
 	t1 := time.Now()
 
-	if err := shellOut(lm.reloadCmd); err != nil {
+	binaryFilename := getBinaryFileName(lm.debug)
+	if err := shellOut(fmt.Sprintf("%v -s %v", binaryFilename, "reload")); err != nil {
 		lm.metricsCollector.IncNginxReloadErrors()
-		return fmt.Errorf("nginx reload failed: %v", err)
+		return fmt.Errorf("nginx reload failed: %w", err)
 	}
 	err := lm.verifyClient.WaitForCorrectVersion(lm.configVersion)
 	if err != nil {
 		lm.metricsCollector.IncNginxReloadErrors()
-		return fmt.Errorf("could not get newest config version: %v", err)
+		return fmt.Errorf("could not get newest config version: %w", err)
 	}
 
 	lm.metricsCollector.IncNginxReloadCount(isEndpointsUpdate)
@@ -304,9 +315,20 @@ func (lm *LocalManager) Reload(isEndpointsUpdate bool) error {
 func (lm *LocalManager) Quit() {
 	glog.V(3).Info("Quitting nginx")
 
-	if err := shellOut(lm.quitCmd); err != nil {
+	binaryFilename := getBinaryFileName(lm.debug)
+	if err := shellOut(fmt.Sprintf("%v -s %v", binaryFilename, "quit")); err != nil {
 		glog.Fatalf("Failed to quit nginx: %v", err)
 	}
+}
+
+// Version returns NGINX version
+func (lm *LocalManager) Version() string {
+	binaryFilename := getBinaryFileName(lm.debug)
+	out, err := exec.Command(binaryFilename, "-v").CombinedOutput()
+	if err != nil {
+		glog.Fatalf("Failed to get nginx version: %v", err)
+	}
+	return string(out)
 }
 
 // UpdateConfigVersionFile writes the config version file.
@@ -333,7 +355,7 @@ func (lm *LocalManager) SetPlusClients(plusClient *client.NginxClient, plusConfi
 func (lm *LocalManager) UpdateServersInPlus(upstream string, servers []string, config ServerConfig) error {
 	err := verifyConfigVersion(lm.plusConfigVersionCheckClient, lm.configVersion)
 	if err != nil {
-		return fmt.Errorf("error verifying config version: %v", err)
+		return fmt.Errorf("error verifying config version: %w", err)
 	}
 
 	glog.V(3).Infof("API has the correct config version: %v.", lm.configVersion)
@@ -352,7 +374,7 @@ func (lm *LocalManager) UpdateServersInPlus(upstream string, servers []string, c
 	added, removed, updated, err := lm.plusClient.UpdateHTTPServers(upstream, upsServers)
 	if err != nil {
 		glog.V(3).Infof("Couldn't update servers of %v upstream: %v", upstream, err)
-		return fmt.Errorf("error updating servers of %v upstream: %v", upstream, err)
+		return fmt.Errorf("error updating servers of %v upstream: %w", upstream, err)
 	}
 
 	glog.V(3).Infof("Updated servers of %v; Added: %v, Removed: %v, Updated: %v", upstream, added, removed, updated)
@@ -364,7 +386,7 @@ func (lm *LocalManager) UpdateServersInPlus(upstream string, servers []string, c
 func (lm *LocalManager) UpdateStreamServersInPlus(upstream string, servers []string) error {
 	err := verifyConfigVersion(lm.plusConfigVersionCheckClient, lm.configVersion)
 	if err != nil {
-		return fmt.Errorf("error verifying config version: %v", err)
+		return fmt.Errorf("error verifying config version: %w", err)
 	}
 
 	glog.V(3).Infof("API has the correct config version: %v.", lm.configVersion)
@@ -379,7 +401,7 @@ func (lm *LocalManager) UpdateStreamServersInPlus(upstream string, servers []str
 	added, removed, updated, err := lm.plusClient.UpdateStreamServers(upstream, upsServers)
 	if err != nil {
 		glog.V(3).Infof("Couldn't update stream servers of %v upstream: %v", upstream, err)
-		return fmt.Errorf("error updating stream servers of %v upstream: %v", upstream, err)
+		return fmt.Errorf("error updating stream servers of %v upstream: %w", upstream, err)
 	}
 
 	glog.V(3).Infof("Updated stream servers of %v; Added: %v, Removed: %v, Updated: %v", upstream, added, removed, updated)
@@ -392,7 +414,7 @@ func (lm *LocalManager) CreateOpenTracingTracerConfig(content string) error {
 	glog.V(3).Infof("Writing OpenTracing tracer config file to %v", jsonFileForOpenTracingTracer)
 	err := createFileAndWrite(jsonFileForOpenTracingTracer, []byte(content))
 	if err != nil {
-		return fmt.Errorf("Failed to write config file: %v", err)
+		return fmt.Errorf("Failed to write config file: %w", err)
 	}
 
 	return nil
@@ -404,14 +426,14 @@ func (lm *LocalManager) CreateOpenTracingTracerConfig(content string) error {
 func verifyConfigVersion(httpClient *http.Client, configVersion int) error {
 	req, err := http.NewRequest("GET", "http://nginx-plus-api/configVersionCheck", nil)
 	if err != nil {
-		return fmt.Errorf("error creating request: %v", err)
+		return fmt.Errorf("error creating request: %w", err)
 	}
 
 	req.Header.Set("x-expected-config-version", fmt.Sprintf("%v", configVersion))
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("error doing request: %v", err)
+		return fmt.Errorf("error doing request: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -479,7 +501,6 @@ func (lm *LocalManager) AppProtectPluginStart(appDone chan error) {
 	go func() {
 		appDone <- cmd.Wait()
 	}()
-
 }
 
 // AppProtectPluginQuit gracefully ends AppProtect Agent.
@@ -489,4 +510,11 @@ func (lm *LocalManager) AppProtectPluginQuit() {
 	if err := shellOut(killcmd); err != nil {
 		glog.Fatalf("Failed to quit AppProtect Plugin: %v", err)
 	}
+}
+
+func getBinaryFileName(debug bool) string {
+	if debug {
+		return nginxBinaryPathDebug
+	}
+	return nginxBinaryPath
 }

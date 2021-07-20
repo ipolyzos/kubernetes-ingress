@@ -4,6 +4,11 @@ on:
   pull_request:
     branches:
       - master
+    paths-ignore:
+      - 'docs/**'
+      - 'examples/**'
+      - 'examples-of-custom-resources/**'
+      - '**.md'
     types:
       - opened
       - reopened
@@ -14,20 +19,18 @@ defaults:
     shell: bash
 
 env:
-  GOLANGCI_VERSION: 1.29
   GOLANGCI_TIMEOUT: 10m0s
 
 jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v2
       - name: Lint Code
         uses: golangci/golangci-lint-action@v2
-        continue-on-error: true
         with:
-          version: 'v${{ env.GOLANGCI_VERSION }}'
           args: --timeout ${{ env.GOLANGCI_TIMEOUT }}
+          only-new-issues: true

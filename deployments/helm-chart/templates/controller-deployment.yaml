@@ -20,6 +20,7 @@ spec:
 {{- if .Values.prometheus.create }}
         prometheus.io/scrape: "true"
         prometheus.io/port: "{{ .Values.prometheus.port }}"
+        prometheus.io/scheme: "{{ .Values.prometheus.scheme }}"
 {{- end }}
 {{- if .Values.controller.pod.annotations }}
 {{ toYaml .Values.controller.pod.annotations | indent 8 }}
@@ -123,7 +124,9 @@ spec:
 {{- end }}
 {{- if .Values.controller.reportIngressStatus.enable }}
           - -report-ingress-status
-{{- if .Values.controller.reportIngressStatus.externalService }}
+{{- if .Values.controller.reportIngressStatus.ingressLink }}
+          - -ingresslink={{ .Values.controller.reportIngressStatus.ingressLink }}
+{{- else if .Values.controller.reportIngressStatus.externalService }}
           - -external-service={{ .Values.controller.reportIngressStatus.externalService }}
 {{- else if and (.Values.controller.service.create) (eq .Values.controller.service.type "LoadBalancer") }}
           - -external-service={{ include "nginx-ingress.serviceName" . }}
@@ -138,10 +141,12 @@ spec:
 {{- end }}
           - -enable-prometheus-metrics={{ .Values.prometheus.create }}
           - -prometheus-metrics-listen-port={{ .Values.prometheus.port }}
+          - -prometheus-tls-secret={{ .Values.prometheus.secret }}
           - -enable-custom-resources={{ .Values.controller.enableCustomResources }}
 {{- if .Values.controller.enableCustomResources }}
           - -enable-tls-passthrough={{ .Values.controller.enableTLSPassthrough }}
           - -enable-snippets={{ .Values.controller.enableSnippets }}
+          - -enable-preview-policies={{ .Values.controller.enablePreviewPolicies }}
 {{- if .Values.controller.globalConfiguration.create }}
           - -global-configuration=$(POD_NAMESPACE)/{{ include "nginx-ingress.name" . }}
 {{- end }}

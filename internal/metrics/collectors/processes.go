@@ -10,15 +10,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// NginxProcessesMetricsCollector implements NginxPorcessesCollector interface and prometheus.Collector interface
+// NginxProcessesMetricsCollector implements prometheus.Collector interface
 type NginxProcessesMetricsCollector struct {
-	// Metrics
 	workerProcessTotal *prometheus.GaugeVec
 }
 
 // NewNginxProcessesMetricsCollector creates a new NginxProcessMetricsCollector
 func NewNginxProcessesMetricsCollector(constLabels map[string]string) *NginxProcessesMetricsCollector {
-	pc := &NginxProcessesMetricsCollector{
+	return &NginxProcessesMetricsCollector{
 		workerProcessTotal: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name:        "nginx_worker_processes_total",
@@ -29,7 +28,6 @@ func NewNginxProcessesMetricsCollector(constLabels map[string]string) *NginxProc
 			[]string{"generation"},
 		),
 	}
-	return pc
 }
 
 // updateWorkerProcessCount sets the number of NGINX worker processes
@@ -49,7 +47,7 @@ func getWorkerProcesses() (int, int, error) {
 
 	procFolders, err := ioutil.ReadDir("/proc")
 	if err != nil {
-		return 0, 0, fmt.Errorf("unable to read directory /proc : %v", err)
+		return 0, 0, fmt.Errorf("unable to read directory /proc : %w", err)
 	}
 
 	for _, folder := range procFolders {
@@ -61,7 +59,7 @@ func getWorkerProcesses() (int, int, error) {
 		cmdlineFile := fmt.Sprintf("/proc/%v/cmdline", folder.Name())
 		content, err := ioutil.ReadFile(cmdlineFile)
 		if err != nil {
-			return 0, 0, fmt.Errorf("unable to read file %v: %v", cmdlineFile, err)
+			return 0, 0, fmt.Errorf("unable to read file %v: %w", cmdlineFile, err)
 		}
 
 		text := string(bytes.TrimRight(content, "\x00"))

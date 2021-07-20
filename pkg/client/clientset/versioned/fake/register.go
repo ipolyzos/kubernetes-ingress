@@ -12,9 +12,11 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 )
 
-var scheme = runtime.NewScheme()
-var codecs = serializer.NewCodecFactory(scheme)
-var parameterCodec = runtime.NewParameterCodec(scheme)
+var (
+	scheme = runtime.NewScheme()
+	codecs = serializer.NewCodecFactory(scheme)
+)
+
 var localSchemeBuilder = runtime.SchemeBuilder{
 	k8sv1alpha1.AddToScheme,
 	k8sv1.AddToScheme,
